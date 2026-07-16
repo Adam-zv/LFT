@@ -1,0 +1,18 @@
+{
+  "positions": [],
+  "cash": 0.0,
+  "settings": {
+    "benchmark": "SPY",
+    "start": "2020-01-01",
+    "end": "2025-06-30",
+    "risk_free": 0.03,
+    "tc_bps": 10.0,
+    "fee_annual": 0.005,
+    "inflation": 0.025,
+    "lookback": 252,
+    "max_weight": 0.25,
+    "ibkr_port": 7497,
+    "ibkr_autosync": 1,
+    "ibkr_watch_minutes": 5
+  }
+}

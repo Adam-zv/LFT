@@ -1,0 +1,9 @@
+anthropic>=0.34
+ib_async>=1.0
+matplotlib>=3.7
+numpy>=1.24
+pandas-datareader>=0.10
+pandas>=2.0
+scipy>=1.10
+statsmodels>=0.14
+yfinance>=0.2.40

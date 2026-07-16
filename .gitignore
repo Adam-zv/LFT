@@ -1,0 +1,42 @@
+# ==========================================================
+#  LFT — files that must NOT go on GitHub
+# ==========================================================
+
+# ---- Personal / brokerage data (NEVER commit) ----
+# app_state.json holds YOUR real positions, cash and settings
+app_state.json
+# local SQLite price cache
+*.db
+*.sqlite
+*.sqlite3
+# personal transaction / position exports
+transactions*.csv
+positions*.csv
+
+# ---- Secrets ----
+.env
+.env.*
+*.key
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# ---- Generated charts / reports ----
+output/
+
+# ---- Local tooling / IDE / OS ----
+.claude/settings.local.json
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

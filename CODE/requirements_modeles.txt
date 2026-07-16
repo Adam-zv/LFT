@@ -1,0 +1,10 @@
+# Dépendances des modules d'estimation (IA, Black-Litterman) et de la métrique
+# Installation :  pip install -r requirements_modeles.txt
+numpy>=1.23
+pandas>=1.5
+scipy>=1.9
+scikit-learn>=1.3
+yfinance>=0.2.40      # source de données live (etape1_acquisition + lft_data)
+torch>=2.0           # Modèle IA : architectures MLP / LSTM
+                     #   → OPTIONNEL : si torch est absent, le Modèle IA tourne
+                     #     quand même avec les seuls modèles scikit-learn.

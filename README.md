@@ -1,6 +1,6 @@
 I’m an ESSEC student with a strong interest in finance, financial markets, portfolio management, and the mathematical and stochastic models that shape them. I am particularly curious about how complex financial concepts can be modeled, analyzed, and applied in practice.
 
-Through independent projects and collaborations with my brother, an engineer, I develop tools and educational content designed to explore, simplify, and make the most fascinating and challenging aspects of finance more accessible.
+Through independent projects. I develop tools and educational content designed to explore, simplify, and make the most fascinating and challenging aspects of finance more accessible.
 
 # LFT — Quantitative portfolio analysis
 

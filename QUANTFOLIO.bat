@@ -1,8 +1,4 @@
 @echo off
-rem Quantfolio launcher - double-click me
+rem Legacy launcher kept for compatibility; starts LFT.
 cd /d "%~dp0"
-start "Quantfolio" /b pythonw gui.py
-if errorlevel 1 (
-    python gui.py
-    pause
-)
+call LFT.bat

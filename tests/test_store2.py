@@ -1,5 +1,5 @@
 """
-Tests for the v2 data store: migration, OHLCV, validation, macro,
+Tests for the v3 data store: migration, provenance, OHLCV, validation, macro,
 maintenance. Run: python tests/test_store2.py
 """
 
@@ -38,7 +38,7 @@ def fake_macro(series, start, end):
 with tempfile.TemporaryDirectory() as tmp:
     tmp = Path(tmp)
 
-    # ------------------------------------------------- migration v1 -> v2
+    # ------------------------------------------------- migration v1 -> v3
     old_db = tmp / "old.db"
     with closing(sqlite3.connect(old_db)) as con, con:
         con.execute("CREATE TABLE prices (ticker TEXT NOT NULL, date TEXT NOT NULL, "
@@ -49,17 +49,26 @@ with tempfile.TemporaryDirectory() as tmp:
     p, src = store_m.get_prices(["AAPL"], "2023-01-03", "2023-01-04")
     check("migration: v1 data preserved", len(p) == 2 and "sqlite" in src,
           f"({p.iloc[0, 0]})")
-    check("migration: schema_version == 2", store_m.stats()["schema_version"] == 2)
+    check("migration: schema_version == 3", store_m.stats()["schema_version"] == 3)
     with closing(sqlite3.connect(old_db)) as con:
         cols = {r[1] for r in con.execute("PRAGMA table_info(prices)")}
-    check("migration: OHLCV columns added",
-          {"open", "high", "low", "volume"} <= cols)
+    check("migration: OHLCV + provenance columns added",
+          {"open", "high", "low", "volume", "raw_close", "adjusted_close",
+           "source", "ingested_at"} <= cols)
 
     # ------------------------------------------------------- write + read
-    db = tmp / "v2.db"
+    db = tmp / "v3.db"
     store = PriceStore(db, downloader=fake_downloader, macro_downloader=fake_macro)
     p1, _ = store.get_prices(["AAPL", "MSFT"], "2021-01-01", "2022-12-31")
     check("prices cached", not p1.empty, f"({p1.shape})")
+    master = store.instrument_master()
+    check("instruments: downloaded universe recorded",
+          set(master.index) >= {"AAPL", "MSFT"}
+          and (master.loc[["AAPL", "MSFT"], "source"] == "fake").all())
+    bars = store.get_ohlcv("AAPL", "2021-01-01", "2021-01-15")
+    check("prices: adjusted close and provenance available",
+          {"raw_close", "adjusted_close", "source", "ingested_at"} <= set(bars.columns)
+          and bars["adjusted_close"].notna().all())
 
     # ------------------------------------------------- validation quality
     bad = pd.DataFrame({
@@ -116,8 +125,10 @@ with tempfile.TemporaryDirectory() as tmp:
           and (hist["status"] == "ok").any())
 
     files = store.export_csv(tmp / "export")
-    check("export_csv writes prices + macro", len(files) == 2
-          and all(Path(f).exists() for f in files))
+    exported = {Path(f).name for f in files}
+    check("export_csv writes prices + macro + instrument master",
+          {"prices_close.csv", "macro.csv", "instruments.csv"} <= exported
+          and all(Path(f).exists() for f in files), f"({sorted(exported)})")
 
     status = store.preload(["JNJ", "XOM", "GLD", "TLT"], "2022-01-01",
                            "2022-12-31", chunk=2)

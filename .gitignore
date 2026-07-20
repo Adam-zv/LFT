@@ -1,5 +1,5 @@
 # ==========================================================
-#  LFT — files that must NOT go on GitHub
+#  LFT - files that must NOT go on GitHub
 # ==========================================================
 
 # ---- Personal / brokerage data (NEVER commit) ----
@@ -40,3 +40,5 @@ output/
 .idea/
 .DS_Store
 Thumbs.db
+# Microsoft Office lock files (open documents)
+~$*

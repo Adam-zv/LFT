@@ -42,6 +42,7 @@ and the probability of loss.
 
 from __future__ import annotations
 
+from concurrent.futures import CancelledError
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -217,33 +218,41 @@ def simulate_gbm(
     inflation: float = DEFAULT_INFLATION,
     batch_size: int = 4_000,
     plot_paths: int = 4_000,
+    progress_callback=None,
+    cancel_event=None,
 ) -> MonteCarloResult:
     """
-    Simulate the portfolio via correlated multivariate GBM.
+    Simulate a constant-mix portfolio via covariance-aggregated GBM.
 
-    Volatilities and correlations come from history (estimated reliably);
-    the DRIFT is the anchored, capped, fee-net expected return (see
-    `anchored_expected_returns`). Correlated shocks: eps_corr = L @ eps_iid.
-    Runs in memory-safe batches so large `n_sims` (50k-100k) stay feasible.
+    The full asset covariance is preserved through w' Sigma w, while the
+    drift is the anchored, capped, fee-net expected return (see
+    `anchored_expected_returns`). For a continuously rebalanced constant-mix
+    portfolio this is the direct GBM formulation; it avoids generating an
+    O(assets^2) shock cube when only portfolio wealth is required. Runs in
+    memory-safe batches so both 200-asset portfolios and long horizons remain
+    practical.
     """
     cols = returns.columns
     log_r = np.log1p(returns)
     cov = log_r.cov().values                                # daily log cov
-    var_annual = np.diag(cov) * TRADING_DAYS
-
-    a_net, port_net = _resolve_drift(
+    _, port_net = _resolve_drift(
         returns, weights, anchor, expected_returns,
         risk_free, equity_premium, shrink, max_annual, cost_annual)
 
-    # Calibrate GBM so that E[annual simple return] matches the anchored net
-    # target: annual log drift g = ln(1 + a_net) - 0.5 * sigma^2.
-    g_annual = np.log1p(a_net.reindex(cols).values) - 0.5 * var_annual
-    mu_d = (g_annual / TRADING_DAYS).astype(np.float32)     # daily log drift
-
-    L = np.linalg.cholesky(cov + 1e-12 * np.eye(len(cov))).astype(np.float32)
     w = weights.reindex(cols).fillna(0.0).values
-    wf32 = (w / w.sum() if not np.isclose(w.sum(), 1) else w).astype(np.float32)
-    n_assets = len(cols)
+    if np.isclose(w.sum(), 0.0):
+        raise ValueError("Portfolio weights must have a positive sum")
+    w = w / w.sum() if not np.isclose(w.sum(), 1.0) else w
+    portfolio_var_daily = max(float(w @ cov @ w), 0.0)
+    portfolio_var_annual = portfolio_var_daily * TRADING_DAYS
+    log_drift_annual = np.log1p(port_net) - 0.5 * portfolio_var_annual
+    mu_daily = np.float32(log_drift_annual / TRADING_DAYS)
+    vol_daily = np.float32(np.sqrt(portfolio_var_daily))
+
+    # Keep the largest temporary daily shock matrix around 128 MB.
+    memory_batch = max(64, int(128_000_000 / max(
+        horizon_days * np.dtype(np.float32).itemsize, 1)))
+    batch_size = int(max(1, min(batch_size, memory_batch)))
 
     plot_n = int(min(n_sims, plot_paths))
     terminal = np.empty(n_sims, dtype=np.float64)
@@ -253,20 +262,26 @@ def simulate_gbm(
     rng = np.random.default_rng(seed)
     done = 0
     while done < n_sims:
+        if cancel_event is not None and cancel_event.is_set():
+            raise CancelledError()
         b = int(min(batch_size, n_sims - done))
-        z = rng.standard_normal((horizon_days, b, n_assets), dtype=np.float32)
-        daily_log = mu_d + z @ L.T                          # correlated shocks
-        np.exp(daily_log, out=daily_log)                    # growth factors
-        port_growth = daily_log @ wf32                      # (days, b)
-        terminal[done:done + b] = initial_value * port_growth.prod(axis=0).astype(np.float64)
+        growth = rng.standard_normal((horizon_days, b), dtype=np.float32)
+        growth *= vol_daily
+        growth += mu_daily
+        np.exp(growth, out=growth)
+        terminal[done:done + b] = (
+            initial_value * growth.prod(axis=0).astype(np.float64))
         if done < plot_n:                                   # keep paths to plot
             take = int(min(b, plot_n - done))
-            cp = np.cumprod(port_growth[:, :take], axis=0)
+            cp = np.cumprod(growth[:, :take], axis=0)
             paths_sub[1:, done:done + take] = initial_value * cp
         done += b
+        if progress_callback is not None:
+            progress_callback(done / n_sims, "Correlated GBM simulations")
 
     return MonteCarloResult(
-        paths_sub, initial_value, horizon_days, "Correlated GBM (Cholesky, anchored)",
+        paths_sub, initial_value, horizon_days,
+        "Constant-mix GBM (full covariance, anchored)",
         terminal_values_full=terminal, inflation=inflation,
         cost_annual=cost_annual, expected_return_annual=port_net)
 
@@ -288,7 +303,10 @@ def simulate_bootstrap(
     max_annual: float = DEFAULT_MAX_ANNUAL,
     cost_annual: float = DEFAULT_COST_ANNUAL,
     inflation: float = DEFAULT_INFLATION,
+    batch_size: int = 4_000,
     plot_paths: int = 4_000,
+    progress_callback=None,
+    cancel_event=None,
 ) -> MonteCarloResult:
     """
     Block bootstrap: draws blocks of `block` consecutive days of historical
@@ -298,6 +316,7 @@ def simulate_bootstrap(
     """
     cols = returns.columns
     w = weights.reindex(cols).fillna(0.0).values
+    w = w / w.sum() if not np.isclose(w.sum(), 1.0) else w
     port_r = returns.values @ w                             # portfolio returns
     n_hist = len(port_r)
 
@@ -312,17 +331,30 @@ def simulate_bootstrap(
 
     rng = np.random.default_rng(seed)
     n_blocks = int(np.ceil(horizon_days / block))
-    starts = rng.integers(0, n_hist - block, size=(n_sims, n_blocks))
-    idx = (starts[:, :, None] + np.arange(block)[None, None, :]).reshape(n_sims, -1)
-    sampled = port_r[idx[:, :horizon_days]]                 # (n_sims, horizon)
-
-    growth = np.cumprod(1 + sampled, axis=1)                # (n_sims, horizon)
-    terminal = initial_value * growth[:, -1].astype(np.float64)
-
     plot_n = int(min(n_sims, plot_paths))
+    terminal = np.empty(n_sims, dtype=np.float64)
     paths_sub = np.empty((horizon_days + 1, plot_n), dtype=np.float64)
     paths_sub[0] = initial_value
-    paths_sub[1:] = (initial_value * growth[:plot_n].T)
+
+    done = 0
+    offsets = np.arange(block)[None, None, :]
+    while done < n_sims:
+        if cancel_event is not None and cancel_event.is_set():
+            raise CancelledError()
+        b = int(min(batch_size, n_sims - done))
+        # high is exclusive: n_hist - block + 1 keeps the last block drawable
+        starts = rng.integers(0, n_hist - block + 1, size=(b, n_blocks))
+        idx = (starts[:, :, None] + offsets).reshape(b, -1)
+        sampled = port_r[idx[:, :horizon_days]]
+        growth = np.cumprod(1 + sampled, axis=1)
+        terminal[done:done + b] = initial_value * growth[:, -1]
+        if done < plot_n:
+            take = int(min(b, plot_n - done))
+            paths_sub[1:, done:done + take] = (
+                initial_value * growth[:take].T)
+        done += b
+        if progress_callback is not None:
+            progress_callback(done / n_sims, "Historical block bootstrap")
 
     return MonteCarloResult(
         paths_sub, initial_value, horizon_days,

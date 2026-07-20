@@ -118,6 +118,36 @@ def from_csv(path: str | Path) -> AccountSnapshot:
 
 # ------------------------------------------------------------- live IBKR
 
+# Currency preference when an account-summary tag is reported once per
+# currency: BASE = the account's base currency, then common fallbacks.
+_BASE_CURRENCY_PREFS = ("BASE", "", "USD", "EUR", "GBP", "CHF")
+
+
+def _summary_value(summary, tag: str) -> float:
+    """
+    Extract one account-summary tag from a list of AccountValue objects.
+
+    IBKR reports NetLiquidation / TotalCashValue once per held currency.
+    We prefer the base-currency figure (av.currency in {"BASE", ""}); when
+    absent, we fall back to the first preferred currency, then to the
+    largest absolute value (the main currency of the account).
+    """
+    vals = [av for av in summary if av.tag == tag]
+    if not vals:
+        return 0.0
+    for pref in _BASE_CURRENCY_PREFS:
+        for av in vals:
+            if av.currency == pref:
+                try:
+                    return float(av.value)
+                except (TypeError, ValueError):
+                    continue
+    try:
+        return float(max(vals, key=lambda av: abs(float(av.value))).value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 class IBKRClient:
     """
     Read-only client for a running TWS / IB Gateway.
@@ -146,27 +176,45 @@ class IBKRClient:
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(
                 f"Could not reach TWS/IB Gateway on {self.host}:{self.port}. "
-                f"Is TWS running with the API enabled? ({exc})"
+                f"Checklist: (1) TWS or IB Gateway running and logged in, "
+                f"(2) API enabled: File > Global Configuration > API > "
+                f"Settings > 'Enable ActiveX and Socket Clients', "
+                f"(3) socket port matches ({self.port}): 7497 TWS paper / "
+                f"7496 TWS live / 4002 Gateway paper / 4001 Gateway live, "
+                f"(4) client ID {self.client_id} not already in use. ({exc})"
             ) from exc
 
         try:
-            positions = [
-                Position(
-                    ticker=p.contract.symbol,
-                    quantity=float(p.position),
-                    avg_cost=float(p.avgCost),
-                    currency=p.contract.currency or "USD",
-                )
-                for p in ib.positions()
-                if p.contract.secType == "STK" and p.position != 0
-            ]
+            # Aggregate per symbol: the same stock held in several sub-
+            # accounts (or an advisor's sub-accounts) appears several times.
+            merged: dict[str, Position] = {}
+            for p in ib.positions():
+                if p.contract.secType != "STK" or p.position == 0:
+                    continue
+                ticker = (p.contract.symbol
+                          or getattr(p.contract, "localSymbol", "")
+                          or "").strip().upper()
+                if not ticker:
+                    continue
+                qty, cost = float(p.position), float(p.avgCost)
+                if ticker in merged:
+                    prev = merged[ticker]
+                    total_qty = prev.quantity + qty
+                    prev.avg_cost = (
+                        (prev.quantity * prev.avg_cost + qty * cost) / total_qty
+                        if total_qty else 0.0)
+                    prev.quantity = total_qty
+                else:
+                    merged[ticker] = Position(
+                        ticker=ticker, quantity=qty, avg_cost=cost,
+                        currency=p.contract.currency or "USD")
+            positions = list(merged.values())
 
-            cash = net_liq = 0.0
-            for av in ib.accountSummary():
-                if av.tag == "TotalCashValue" and av.currency == "USD":
-                    cash = float(av.value)
-                elif av.tag == "NetLiquidation" and av.currency == "USD":
-                    net_liq = float(av.value)
+            # accountSummary() auto-requests the summary on first call
+            # (blocking ~0.25 s). Values come once per currency, so pick the
+            # account-base figure rather than assuming USD.
+            cash = _summary_value(ib.accountSummary(), "TotalCashValue")
+            net_liq = _summary_value(ib.accountSummary(), "NetLiquidation")
 
             return AccountSnapshot(positions=positions, cash=cash,
                                    net_liquidation=net_liq, source="ibkr")

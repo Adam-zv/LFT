@@ -24,6 +24,7 @@ Pages:
 from __future__ import annotations
 
 import json
+import datetime as dt
 import sqlite3
 import sys
 import tempfile
@@ -48,7 +49,7 @@ DEFAULT_STATE = {
     "settings": {
         "benchmark": "SPY",
         "start": "2020-01-01",
-        "end": "2025-06-30",
+        "end": "today",
         "risk_free": 0.03,
         "tc_bps": 10.0,
         "fee_annual": 0.005,      # ongoing fees drag for projections (0.5%/yr)
@@ -94,6 +95,10 @@ class App:
         self.state = self._load_state()
         self._prices = None            # cached price DataFrame
         self._prices_key = None        # (tickers, start, end) of the cache
+        self._context_cache_key = None
+        self._context_cache_value = None
+        self._strategy_cache_key = None
+        self._strategy_cache_value = None
         OUTPUT_DIR.mkdir(exist_ok=True)
         try:
             self.store = PriceStore(APP_DIR / "quantfolio_prices.db")
@@ -109,6 +114,8 @@ class App:
                 state = json.loads(json.dumps(DEFAULT_STATE))
                 state.update({k: loaded[k] for k in loaded if k != "settings"})
                 state["settings"].update(loaded.get("settings", {}))
+                if state["settings"].get("end") == "2025-06-30":
+                    state["settings"]["end"] = "today"
                 return state
             except (json.JSONDecodeError, KeyError):
                 print("(!) app_state.json unreadable, starting fresh.")
@@ -131,13 +138,29 @@ class App:
         s = self.state["settings"]
         return sorted({p["ticker"] for p in self.state["positions"]} | {s["benchmark"]})
 
-    def prices(self) -> tuple[pd.DataFrame, str]:
+    @staticmethod
+    def _resolve_date(value: str, *, today: dt.date | None = None) -> str:
+        """Resolve dynamic date settings while preserving explicit backtests."""
+        raw = str(value).strip()
+        if raw.lower() in {"today", "auto", "now", ""}:
+            return (today or dt.date.today()).isoformat()
+        return pd.Timestamp(raw).date().isoformat()
+
+    def analysis_dates(self) -> tuple[str, str]:
         s = self.state["settings"]
-        key = (tuple(self.universe()), s["start"], s["end"])
+        start = self._resolve_date(s["start"])
+        end = self._resolve_date(s["end"])
+        if start >= end:
+            raise ValueError(f"Analysis start ({start}) must be before end ({end}).")
+        return start, end
+
+    def prices(self) -> tuple[pd.DataFrame, str]:
+        start, end = self.analysis_dates()
+        key = (tuple(self.universe()), start, end)
         if self._prices is None or self._prices_key != key:
             print("Loading prices...")
             self._prices, self._source = self.store.get_prices(
-                list(key[0]), s["start"], s["end"])
+                list(key[0]), start, end)
             self._prices_key = key
             print(f"  source: {self._source} | {len(self._prices)} days")
             if self._source == "synthetic":
@@ -155,6 +178,13 @@ class App:
         """Common objects used by most pages."""
         s = self.state["settings"]
         prices, _ = self.prices()
+        positions_key = tuple(sorted(
+            (p["ticker"], float(p["quantity"]), float(p.get("avg_cost", 0.0)))
+            for p in self.state["positions"]))
+        key = (self._prices_key, id(prices), positions_key,
+               float(self.state.get("cash", 0.0)), s["benchmark"])
+        if key == self._context_cache_key:
+            return self._context_cache_value
         held = [p["ticker"] for p in self.state["positions"] if p["ticker"] in prices.columns]
         asset_prices = prices[held]
         asset_returns = data.to_returns(asset_prices)
@@ -163,7 +193,10 @@ class App:
         snap = self.snapshot
         weights = snap.weights(last)
         value = snap.market_value(last) + snap.cash
-        return s, prices, asset_returns, bench, last, snap, weights, value
+        result = (s, prices, asset_returns, bench, last, snap, weights, value)
+        self._context_cache_key = key
+        self._context_cache_value = result
+        return result
 
     # ------------------------------------------------------------ pages
 
@@ -251,12 +284,21 @@ class App:
             print("    Global Configuration > API > Settings? Correct port?")
 
     def _adopt_snapshot(self, snap: broker.AccountSnapshot):
+        old_universe = self.universe()
         self.state["positions"] = [
             {"ticker": p.ticker, "quantity": p.quantity, "avg_cost": p.avg_cost}
             for p in snap.positions]
         if snap.source == "ibkr" or snap.cash:
             self.state["cash"] = snap.cash
-        self._prices = None
+        self.store.upsert_instruments([
+            {"ticker": p.ticker, "currency": p.currency,
+             "source": snap.source or "portfolio"}
+            for p in snap.positions])
+        # Quantity/cost changes do not invalidate market prices. Only a new or
+        # removed symbol requires another data query.
+        if self.universe() != old_universe:
+            self._prices = None
+            self._prices_key = None
         self.save()
 
     def page_market(self):
@@ -284,16 +326,27 @@ class App:
 
     def _target_strategies(self, asset_returns):
         s = self.state["settings"]
-        mu, cov = opt.annualized_inputs(asset_returns, shrinkage=True)
+        cache_key = (id(asset_returns), float(s["risk_free"]),
+                     float(s["max_weight"]))
+        if cache_key == self._strategy_cache_key:
+            strategies, mu, cov = self._strategy_cache_value
+            return ({name: weights.copy() for name, weights in strategies.items()},
+                    mu.copy(), cov.copy())
+        mu, cov = opt.annualized_inputs(
+            asset_returns, shrinkage=True, mean_shrinkage=0.5)
         n = len(mu)
         cap = max(s["max_weight"], 1.0 / n + 0.01)
         bounds = opt.weight_bounds(n, cap)
-        return {
+        strategies = {
             "MaxSharpe (LW + cap)": opt.max_sharpe_weights(mu, cov, s["risk_free"], bounds),
             "MinVol (LW + cap)": opt.min_volatility_weights(cov, bounds),
-            "RiskParity": opt.risk_parity_weights(cov),
+            "RiskParity": opt.risk_parity_weights(cov, bounds),
             "EqualWeight": opt.equal_weights(list(asset_returns.columns)),
-        }, mu, cov
+        }
+        self._strategy_cache_key = cache_key
+        self._strategy_cache_value = (strategies, mu, cov)
+        return ({name: weights.copy() for name, weights in strategies.items()},
+                mu.copy(), cov.copy())
 
     def page_optimization(self):
         header("4. OPTIMIZATION - Markowitz strategies")
@@ -312,8 +365,10 @@ class App:
             r_, v_ = opt.portfolio_return(wv, mu), opt.portfolio_volatility(wv, cov)
             print(f"  {name:<22} {r_:7.2%}  {v_:7.2%}  {(r_ - s['risk_free']) / v_:5.2f}")
         if ask("\nSave efficient frontier chart? (y/n)", "n").lower() == "y":
-            frontier = opt.efficient_frontier(mu, cov, n_points=30)
-            cloud = opt.random_portfolios(mu, cov, n=3000)
+            cap = max(s["max_weight"], 1.0 / len(mu) + 0.01)
+            bounds = opt.weight_bounds(len(mu), cap)
+            frontier = opt.efficient_frontier(mu, cov, n_points=100, bounds=bounds)
+            cloud = opt.random_portfolios(mu, cov, n=3000, bounds=bounds)
             highlights = {
                 "MaxSharpe": (opt.portfolio_volatility(strategies["MaxSharpe (LW + cap)"].values, cov),
                               opt.portfolio_return(strategies["MaxSharpe (LW + cap)"].values, mu)),

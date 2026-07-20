@@ -5,6 +5,8 @@ Run: python tests/test_improvements.py
 
 import sys
 import tempfile
+import threading
+from concurrent.futures import CancelledError
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -12,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
 import pandas as pd
 
-from quantfolio import data, optimization as opt, backtest
+from quantfolio import data, optimization as opt, backtest, montecarlo as mc
 from quantfolio import walkforward as wf
 from quantfolio.store import PriceStore
 
@@ -61,11 +63,51 @@ check("25% cap: respected", (w_cap <= 0.25 + 1e-8).all(),
       f"(max={w_cap.max():.3f})")
 check("25% cap: sum=1", np.isclose(w_cap.sum(), 1, atol=1e-6))
 
+frontier = opt.efficient_frontier(mu, cov, n_points=35, bounds=bounds)
+frontier_weights = frontier.filter(like="w_")
+check("frontier: uses the same 25% cap",
+      len(frontier) >= 30 and frontier_weights.to_numpy().max() <= 0.25 + 1e-6,
+      f"({len(frontier)} points, max={frontier_weights.to_numpy().max():.3f})")
+
+cloud = opt.random_portfolios(mu, cov, n=500, bounds=bounds)
+cloud_weights = cloud.filter(like="w_")
+check("random cloud: feasible under the same cap",
+      np.allclose(cloud_weights.sum(axis=1), 1.0, atol=1e-8)
+      and cloud_weights.to_numpy().max() <= 0.25 + 1e-8)
+
+band = opt.frontier_uncertainty_band(RETURNS, frontier, n_boot=5, block=20)
+check("frontier: bootstrap uncertainty band is ordered",
+      len(band) == len(frontier)
+      and (band["return_p10"] <= band["return_p50"]).all()
+      and (band["return_p50"] <= band["return_p90"]).all())
+
+mu_raw, _ = opt.annualized_inputs(RETURNS, shrinkage=True, mean_shrinkage=0.0)
+mu_stable, _ = opt.annualized_inputs(RETURNS, shrinkage=True, mean_shrinkage=0.5)
+check("expected-return shrinkage reduces cross-sectional noise",
+      mu_stable.std() < mu_raw.std())
+
 try:
     opt.weight_bounds(4, max_weight=0.2)
     check("infeasible bounds rejected", False)
 except ValueError:
     check("infeasible bounds rejected", True)
+
+# ------------------------------------------------ Monte Carlo orchestration
+progress = []
+mc.simulate_gbm(RETURNS, opt.equal_weights(RETURNS.columns), 10_000,
+                horizon_days=30, n_sims=600, batch_size=150,
+                progress_callback=lambda ratio, _label: progress.append(ratio))
+check("Monte Carlo: reports determinate progress",
+      len(progress) >= 4 and np.isclose(progress[-1], 1.0))
+
+cancel = threading.Event()
+cancel.set()
+try:
+    mc.simulate_bootstrap(RETURNS, opt.equal_weights(RETURNS.columns),
+                          horizon_days=30, n_sims=600, cancel_event=cancel)
+    check("Monte Carlo: cancellation is cooperative", False)
+except CancelledError:
+    check("Monte Carlo: cancellation is cooperative", True)
 
 # --------------------------------------------------------- walk-forward
 # 1. anti-look-ahead: a spy strategy verifies its window ends exactly

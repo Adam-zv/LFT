@@ -12,15 +12,48 @@ as the console edition (app.py) - you can switch between the two freely.
 
 from __future__ import annotations
 
-import threading
+import ctypes
+
+
+def enable_windows_dpi_awareness():
+    """Prevent Windows from bitmap-scaling the Tk window into a blur."""
+    try:
+        per_monitor_v2 = ctypes.c_void_p(-4)
+        if ctypes.windll.user32.SetProcessDpiAwarenessContext(per_monitor_v2):
+            return
+    except (AttributeError, OSError, ValueError):
+        pass
+    try:
+        if ctypes.windll.shcore.SetProcessDpiAwareness(2) == 0:
+            return
+    except (AttributeError, OSError, ValueError):
+        pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except (AttributeError, OSError, ValueError):
+        pass
+
+
+# DPI context must be fixed before importing Tkinter or a GUI backend.
+enable_windows_dpi_awareness()
+
+from concurrent.futures import CancelledError
+import itertools
 import queue
+import threading
+import time
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import ttk, filedialog, messagebox
 
+import matplotlib as mpl
+import matplotlib.dates as mdates
+import numpy as np
 import pandas as pd
+from matplotlib.collections import LineCollection
 from matplotlib.figure import Figure
-from matplotlib.patches import Patch
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.patches import Patch, Rectangle
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 
 from app import App                      # tested backend: state, data, strategies
 from quantfolio import data, metrics, optimization as opt
@@ -32,6 +65,14 @@ PAGES = ["Portfolio", "Market data", "Health check", "Optimization",
          "Rebalance", "Projection", "Backtest", "Performance", "AI analyst",
          "IBKR connection", "Settings"]
 
+APP_BG = "#e2e3e5"
+PLOT_BG = "#f8f9fb"
+SIDEBAR_BG = "#1f2732"
+SIDEBAR_ACTIVE = "#324153"
+TEXT = "#17202b"
+MUTED = "#596575"
+ACCENT = "#2a78d6"
+BORDER = "#aeb5bd"
 
 # ------------------------------------------------------------ small helpers
 
@@ -55,52 +96,75 @@ def make_tree(parent, height=12) -> ttk.Treeview:
     frame.pack(fill="both", expand=True, pady=4)
     tree = ttk.Treeview(frame, show="headings", height=height)
     vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
-    tree.configure(yscrollcommand=vsb.set)
-    tree.pack(side="left", fill="both", expand=True)
-    vsb.pack(side="right", fill="y")
+    hsb = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
+    tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+    tree.grid(row=0, column=0, sticky="nsew")
+    vsb.grid(row=0, column=1, sticky="ns")
+    hsb.grid(row=1, column=0, sticky="ew")
+    frame.rowconfigure(0, weight=1)
+    frame.columnconfigure(0, weight=1)
     return tree
 
 
 class Gui(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("LFT - Le Fort - portfolio management")
-        self.geometry("1180x760")
-        self.minsize(980, 640)
-        try:
-            ttk.Style(self).theme_use("clam")
-        except tk.TclError:
-            pass
+        self.title("LFT - LeFort - Portfolio Management")
+        self.update_idletasks()
+        self._display_dpi = max(96.0, min(240.0, self.winfo_fpixels("1i")))
+        self._ui_scale = self._display_dpi / 96.0
+        self.tk.call("tk", "scaling", self._display_dpi / 72.0)
+        width = min(int(self.winfo_screenwidth() * 0.92),
+                    round(1180 * self._ui_scale))
+        height = min(int(self.winfo_screenheight() * 0.90),
+                     round(760 * self._ui_scale))
+        self.geometry(f"{width}x{height}")
+        self.minsize(min(width, round(980 * self._ui_scale)),
+                     min(height, round(640 * self._ui_scale)))
+        self._plot_dpi = max(110, min(190, round(self._display_dpi * 1.12)))
+        self.configure(bg=APP_BG)
+        self._configure_style()
+        self._set_lft_icon()
 
         self.backend = App()             # engine + persisted state
         self._queue: queue.Queue = queue.Queue()
-        self._busy = False
+        self._tasks: dict[str, dict | None] = {
+            "compute": None,
+            "ibkr": None,
+            "background": None,
+        }
+        self._current_page = None
+        self._task_ids = itertools.count(1)
         self._ibkr_watch_job = None
+        self._result_cache = {}
 
         # ---- layout: sidebar | content
-        sidebar = tk.Frame(self, bg="#1f2732", width=180)
+        sidebar = tk.Frame(self, bg=SIDEBAR_BG,
+                           width=round(180 * self._ui_scale))
         sidebar.pack(side="left", fill="y")
         sidebar.pack_propagate(False)
-        brand = tk.Frame(sidebar, bg="#1f2732")
+        brand = tk.Frame(sidebar, bg=SIDEBAR_BG)
         brand.pack(fill="x", pady=(18, 16))
-        tk.Label(brand, text="LFT", bg="#1f2732", fg="white",
+        tk.Label(brand, text="LFT", bg=SIDEBAR_BG, fg="white",
                  font=("Segoe UI", 19, "bold")).pack(anchor="w", padx=18)
         self._nav_buttons = {}
         for name in PAGES:
             b = tk.Button(sidebar, text=name, relief="flat", anchor="w",
-                          bg="#1f2732", fg="#c9d4e0", activebackground="#324153",
+                          bg=SIDEBAR_BG, fg="#c9d4e0", activebackground=SIDEBAR_ACTIVE,
                           activeforeground="white", padx=18, pady=8,
                           font=("Segoe UI", 10),
                           command=lambda n=name: self.show_page(n))
             b.pack(fill="x")
             self._nav_buttons[name] = b
         tk.Label(sidebar, text="Educational tool.\nNot investment advice.",
-                 bg="#1f2732", fg="#6b7a8c", font=("Segoe UI", 8),
+                 bg=SIDEBAR_BG, fg="#8290a0", font=("Segoe UI", 8),
                  justify="left", padx=18, pady=14).pack(side="bottom", fill="x")
 
         self.status = tk.StringVar(value="Ready.")
         statusbar = tk.Label(self, textvariable=self.status, anchor="w",
-                             bd=1, relief="sunken", padx=8)
+                             bg="#f4f5f6", fg=TEXT, bd=1, relief="solid",
+                             highlightthickness=0, padx=8, pady=3,
+                             font=("Segoe UI", 9))
         statusbar.pack(side="bottom", fill="x")
 
         self.content = ttk.Frame(self, padding=14)
@@ -112,6 +176,89 @@ class Gui(tk.Tk):
             self.after(800, self._autosync_ibkr)
         self._schedule_ibkr_watch()
         self.after(1500, self._show_data_freshness)
+
+    def _configure_style(self):
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont"):
+            try:
+                tkfont.nametofont(name).configure(family="Segoe UI", size=10)
+            except tk.TclError:
+                pass
+        try:
+            tkfont.nametofont("TkHeadingFont").configure(
+                family="Segoe UI", size=10, weight="bold")
+        except tk.TclError:
+            pass
+
+        style.configure(".", background=APP_BG, foreground=TEXT,
+                        font=("Segoe UI", 10))
+        style.configure("TFrame", background=APP_BG)
+        style.configure("TLabel", background=APP_BG, foreground=TEXT)
+        style.configure("TButton", background="#f1f2f4", foreground=TEXT,
+                        bordercolor=BORDER, lightcolor="#ffffff",
+                        darkcolor="#8e969f", borderwidth=1, padding=(10, 6),
+                        relief="raised")
+        style.map("TButton",
+                  background=[("active", "#ffffff"), ("pressed", "#d8dadd"),
+                              ("disabled", "#d7d9dc")],
+                  foreground=[("disabled", "#808891")])
+        style.configure("TEntry", fieldbackground="#ffffff", foreground=TEXT,
+                        bordercolor=BORDER, insertcolor=TEXT, padding=4)
+        style.configure("TCombobox", fieldbackground="#ffffff", foreground=TEXT,
+                        bordercolor=BORDER, padding=4)
+        style.configure("Treeview", background="#fbfcfd",
+                        fieldbackground="#fbfcfd", foreground=TEXT,
+                        bordercolor=BORDER, borderwidth=1,
+                        rowheight=round(24 * self._ui_scale))
+        style.configure("Treeview.Heading", background="#d5d9de",
+                        foreground=TEXT, bordercolor=BORDER, padding=(6, 5),
+                        font=("Segoe UI", 9, "bold"))
+        style.map("Treeview", background=[("selected", SIDEBAR_ACTIVE)],
+                  foreground=[("selected", "white")])
+        style.configure("TSeparator", background=BORDER)
+        style.configure("Horizontal.TProgressbar", troughcolor="#c9cdd2",
+                        background=ACCENT, bordercolor=BORDER,
+                        lightcolor=ACCENT, darkcolor=ACCENT)
+
+        mpl.rcParams.update({
+            "font.family": "Segoe UI",
+            "font.size": 9.5,
+            "figure.facecolor": APP_BG,
+            "axes.facecolor": PLOT_BG,
+            "axes.edgecolor": "#7d8792",
+            "axes.labelcolor": TEXT,
+            "xtick.color": "#3f4a56",
+            "ytick.color": "#3f4a56",
+            "grid.color": "#b7bec6",
+            "grid.linewidth": 0.7,
+            "savefig.dpi": self._plot_dpi,
+        })
+
+    def _set_lft_icon(self):
+        icon = tk.PhotoImage(width=32, height=32)
+        icon.put(SIDEBAR_BG, to=(0, 0, 32, 32))
+        patterns = {
+            "L": ("100", "100", "100", "100", "111"),
+            "F": ("111", "100", "110", "100", "100"),
+            "T": ("111", "010", "010", "010", "010"),
+        }
+        x0, y0, pixel = 4, 10, 2
+        for char in "LFT":
+            for row, bits in enumerate(patterns[char]):
+                for col, bit in enumerate(bits):
+                    if bit == "1":
+                        x = x0 + col * pixel
+                        y = y0 + row * pixel
+                        icon.put("#ffffff", to=(x, y, x + pixel, y + pixel))
+            x0 += 9
+        icon.put(ACCENT, to=(0, 0, 32, 2))
+        self.iconphoto(True, icon)
+        self._lft_icon = icon
 
     def _show_data_freshness(self):
         """Startup status-bar note: how fresh the cached market data is."""
@@ -129,7 +276,8 @@ class Gui(tk.Tk):
                                 "synthetic demo data).")
 
         self.run_async(work, done, "Checking data freshness...",
-                       silent_errors=True)
+                       silent_errors=True, channel="background",
+                       skip_if_busy=True)
 
     def _ibkr_client(self, timeout=10.0):
         s = self.backend.state["settings"]
@@ -191,7 +339,8 @@ class Gui(tk.Tk):
             self.show_page("Portfolio")
 
         self.run_async(work, done, "IBKR watch: checking for changes...",
-                       silent_errors=True)
+                       silent_errors=True, channel="ibkr",
+                       skip_if_busy=True)
         self._schedule_ibkr_watch()
 
     def _autosync_ibkr(self):
@@ -207,50 +356,137 @@ class Gui(tk.Tk):
             self.show_page("Portfolio")
 
         self.run_async(work, done, "Auto-syncing with IBKR...",
-                       silent_errors=True)
+                       silent_errors=True, channel="ibkr",
+                       skip_if_busy=True)
 
     # ------------------------------------------------------ infrastructure
 
     def _poll(self):
         try:
             while True:
-                (status, payload), on_done = self._queue.get_nowait()
-                self._busy = False
-                if status == "silent_err":
+                event = self._queue.get_nowait()
+                channel = event["channel"]
+                current = self._tasks.get(channel)
+                if current is None or current["id"] != event["task_id"]:
+                    continue
+                if event["type"] == "progress":
+                    fraction = event["fraction"]
+                    eta = event["eta"]
+                    message = event["message"] or current["busy_msg"]
+                    suffix = f" | ETA {eta:.0f}s" if eta is not None else ""
+                    self.status.set(f"{message} ({fraction:.0%}){suffix}")
+                    if current["on_progress"] is not None:
+                        current["on_progress"](fraction, message, eta)
+                    continue
+
+                self._tasks[channel] = None
+                status, payload = event["status"], event.get("payload")
+                if status == "cancelled":
+                    self.status.set("Computation cancelled.")
+                    if current["on_cancel"] is not None:
+                        current["on_cancel"]()
+                elif status == "silent_err":
+                    if current["on_error"] is not None:
+                        current["on_error"](payload)
                     self.status.set(f"(background task failed: {payload})")
                 elif status == "err":
+                    if current["on_error"] is not None:
+                        current["on_error"](payload)
                     self.status.set(f"Error: {payload}")
                     messagebox.showerror("LFT", str(payload))
                 else:
-                    on_done(payload)
                     self.status.set("Done.")
+                    event["on_done"](payload)
         except queue.Empty:
             pass
         self.after(120, self._poll)
 
     def run_async(self, work, on_done, busy_msg="Computing...",
-                  silent_errors=False):
-        if self._busy:
-            self.status.set("Please wait, a computation is running...")
-            return
-        self._busy = True
+                  silent_errors=False, *, channel="compute",
+                  contextual=False, cancellable=False, on_progress=None,
+                  on_cancel=None, on_error=None, skip_if_busy=False):
+        self._tasks.setdefault(channel, None)
+        if self._tasks[channel] is not None:
+            if not skip_if_busy:
+                label = "IBKR synchronization" if channel == "ibkr" else "computation"
+                self.status.set(f"Please wait, a {label} is already running...")
+            return None
+
+        task_id = next(self._task_ids)
+        cancel_event = threading.Event()
+        started = time.perf_counter()
+        self._tasks[channel] = {
+            "id": task_id,
+            "cancel_event": cancel_event,
+            "busy_msg": busy_msg,
+            "on_progress": on_progress,
+            "on_cancel": on_cancel,
+            "on_error": on_error,
+            "cancellable": cancellable,
+        }
         self.status.set(busy_msg)
+
+        def progress(fraction, message=None):
+            fraction = max(0.0, min(1.0, float(fraction)))
+            elapsed = time.perf_counter() - started
+            eta = (elapsed * (1.0 - fraction) / fraction
+                   if 0.02 <= fraction < 1.0 else None)
+            self._queue.put({
+                "type": "progress", "channel": channel, "task_id": task_id,
+                "fraction": fraction, "message": message, "eta": eta,
+            })
 
         def worker():
             try:
-                self._queue.put((("ok", work()), on_done))
+                payload = (work(progress, cancel_event)
+                           if contextual else work())
+                if cancel_event.is_set():
+                    raise CancelledError()
+                status = "ok"
+            except CancelledError:
+                status, payload = "cancelled", None
             except Exception as exc:  # noqa: BLE001
-                kind = "silent_err" if silent_errors else "err"
-                self._queue.put(((kind, exc), on_done))
+                status = "silent_err" if silent_errors else "err"
+                payload = exc
+            self._queue.put({
+                "type": "result", "channel": channel, "task_id": task_id,
+                "status": status, "payload": payload, "on_done": on_done,
+            })
         threading.Thread(target=worker, daemon=True).start()
+        return cancel_event
+
+    def cancel_task(self, channel="compute"):
+        task = self._tasks.get(channel)
+        if task is not None and task["cancellable"]:
+            task["cancel_event"].set()
+            self.status.set("Cancelling after the current calculation step...")
 
     def clear_content(self):
+        def release_figures(widget):
+            figure = getattr(widget, "_lft_figure", None)
+            if figure is not None:
+                try:
+                    figure.set_layout_engine(None)
+                except (AttributeError, ValueError):
+                    pass
+            for child in widget.winfo_children():
+                release_figures(child)
+
         for w in self.content.winfo_children():
+            release_figures(w)
             w.destroy()
 
     def show_page(self, name: str):
+        # A page owns its computation. Navigating away requests cancellation
+        # and immediately releases the UI slot; any late result is discarded
+        # by the task-id check in _poll.
+        current = self._tasks.get("compute")
+        if current is not None:
+            current["cancel_event"].set()
+            self._tasks["compute"] = None
+        self._current_page = name
         for n, b in self._nav_buttons.items():
-            b.configure(bg="#324153" if n == name else "#1f2732")
+            b.configure(bg=SIDEBAR_ACTIVE if n == name else SIDEBAR_BG)
         self.clear_content()
         ttk.Label(self.content, text=name, font=("Segoe UI", 16, "bold")
                   ).pack(anchor="w", pady=(0, 10))
@@ -265,10 +501,34 @@ class Gui(tk.Tk):
             return True
         return False
 
-    def embed_chart(self, fig: Figure, parent=None):
-        canvas = FigureCanvasTkAgg(fig, master=parent or self.content)
+    def new_figure(self, figsize):
+        return Figure(figsize=figsize, dpi=self._plot_dpi, facecolor=APP_BG,
+                      layout="constrained")
+
+    def _calculation_signature(self, prices, feature, *extra):
+        s = self.backend.state["settings"]
+        positions = tuple(sorted(
+            (p["ticker"], float(p["quantity"]), float(p.get("avg_cost", 0.0)))
+            for p in self.backend.state["positions"]))
+        market = (tuple(prices.columns), len(prices),
+                  str(prices.index[0]), str(prices.index[-1]))
+        settings = tuple(sorted((key, str(value)) for key, value in s.items()))
+        return (feature, market, positions,
+                float(self.backend.state.get("cash", 0.0)), settings, extra)
+
+    def embed_chart(self, fig: Figure, parent=None, *, toolbar=False):
+        host = ttk.Frame(parent or self.content)
+        host._lft_figure = fig
+        host.pack(fill="both", expand=True, pady=6)
+        canvas = FigureCanvasTkAgg(fig, master=host)
         canvas.draw()
         canvas.get_tk_widget().pack(fill="both", expand=True, pady=6)
+        if toolbar:
+            nav = NavigationToolbar2Tk(canvas, host, pack_toolbar=False)
+            nav.update()
+            nav.pack(fill="x")
+            canvas._lft_toolbar = nav
+        return canvas
 
     # --------------------------------------------------------- 1 portfolio
 
@@ -385,7 +645,8 @@ class Gui(tk.Tk):
                                 f"(cash {snap.cash:,.2f}).")
             self._pos_refresh()
 
-        self.run_async(work, done, f"Connecting to IBKR on port {port} (read-only)...")
+        self.run_async(work, done, f"Connecting to IBKR on port {port} (read-only)...",
+                       channel="ibkr")
 
     def _set_cash(self):
         try:
@@ -400,17 +661,50 @@ class Gui(tk.Tk):
     def page_market_data(self):
         if self.need_positions():
             return
-        ttk.Button(self.content, text="Compute metrics",
-                   command=self._market_run).pack(anchor="w")
-        self.tree_market = make_tree(self.content, height=11)
+        controls = ttk.Frame(self.content)
+        controls.pack(fill="x")
+        ttk.Button(controls, text="Compute metrics",
+                   command=self._market_run).pack(side="left")
+        self.var_corr_cluster = tk.BooleanVar(value=True)
+        ttk.Checkbutton(controls, text="Cluster similar assets",
+                        variable=self.var_corr_cluster,
+                        command=self._market_run).pack(side="left", padx=12)
+        ttk.Label(controls, text="Find ticker or pair:").pack(side="left")
+        self.var_corr_search = tk.StringVar()
+        search = ttk.Entry(controls, textvariable=self.var_corr_search, width=18)
+        search.pack(side="left", padx=4)
+        search.bind("<Return>", lambda _event: self._correlation_search())
+        ttk.Button(controls, text="Find",
+                   command=self._correlation_search).pack(side="left")
+        self.var_data_provenance = tk.StringVar(value="Loading data provenance...")
+        self.lbl_data_provenance = ttk.Label(
+            self.content, textvariable=self.var_data_provenance, foreground=MUTED)
+        self.lbl_data_provenance.pack(anchor="w", pady=(6, 0))
+        self.tree_market = make_tree(self.content, height=8)
         ttk.Label(self.content, text="Correlation matrix - the heart of "
-                  "diversification (blue = moves together, red = opposite):"
+                  "diversification (red = moves together, blue = opposite):"
                   ).pack(anchor="w", pady=(8, 0))
-        self.chart_corr = ttk.Frame(self.content)
+        body = ttk.Panedwindow(self.content, orient="horizontal")
+        body.pack(fill="both", expand=True)
+        left = ttk.Frame(body)
+        right = ttk.Frame(body, padding=(12, 0, 0, 0))
+        body.add(left, weight=4)
+        body.add(right, weight=1)
+        self.chart_corr = ttk.Frame(left)
         self.chart_corr.pack(fill="both", expand=True)
+        ttk.Label(right, text="Strongest relationships",
+                  font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        self.var_corr_hover = tk.StringVar(
+            value="Hover over a cell to inspect the pair.")
+        ttk.Label(right, textvariable=self.var_corr_hover, foreground=MUTED,
+                  wraplength=280, justify="left").pack(anchor="w", pady=(4, 6))
+        self.tree_corr_pairs = make_tree(right, height=12)
+        self._corr_search_artists = []
         self._market_run()
 
     def _market_run(self):
+        clustered = bool(self.var_corr_cluster.get())
+
         def work():
             s, prices, asset_returns, bench, last, snap, weights, value = \
                 self.backend.portfolio_context()
@@ -420,31 +714,136 @@ class Gui(tk.Tk):
             stats["MyPortfolio"] = metrics.summary(
                 port_r.rename("MyPortfolio"), bench, s["risk_free"]).iloc[:, 0]
             corr = asset_returns.corr()
-            return stats.round(4), corr
+            store_stats = self.backend.store.stats()
+            source = getattr(self.backend, "_source", "unknown")
+            last_date = asset_returns.index.max().date().isoformat()
+            if clustered and len(corr) > 2:
+                from scipy.cluster.hierarchy import leaves_list, linkage
+                from scipy.spatial.distance import squareform
+                clean = corr.fillna(0.0).clip(-1.0, 1.0)
+                distance = np.sqrt(np.maximum(0.0, (1.0 - clean.values) / 2.0))
+                np.fill_diagonal(distance, 0.0)
+                order = leaves_list(linkage(squareform(
+                    distance, checks=False), method="average"))
+                corr = corr.iloc[order, order]
+            pairs = []
+            for i in range(len(corr)):
+                for j in range(i + 1, len(corr)):
+                    value = float(corr.iat[i, j])
+                    if np.isfinite(value):
+                        pairs.append((corr.index[i], corr.columns[j], value))
+            pairs.sort(key=lambda item: abs(item[2]), reverse=True)
+            pair_df = pd.DataFrame(
+                {"Correlation": [p[2] for p in pairs[:25]]},
+                index=[f"{p[0]} / {p[1]}" for p in pairs[:25]])
+            provenance = {
+                "source": source, "last_date": last_date,
+                "rows": store_stats["price_rows"],
+                "flags": store_stats["quality_flags"],
+            }
+            return stats.round(4), corr, pair_df, provenance
 
         def done(payload):
-            stats, corr = payload
+            if not self.chart_corr.winfo_exists():
+                return
+            stats, corr, pair_df, provenance = payload
             df_to_tree(self.tree_market, stats, "metric")
+            df_to_tree(self.tree_corr_pairs, pair_df.round(3), "pair")
+            self.var_data_provenance.set(
+                f"Source: {provenance['source']} | adjusted daily prices through "
+                f"{provenance['last_date']} | {provenance['rows']:,} cached rows | "
+                f"{provenance['flags']} quality flag(s)")
+            self.lbl_data_provenance.configure(
+                foreground="#9a2f2f" if provenance["source"] == "synthetic" else MUTED)
             n = len(corr)
-            fig = Figure(figsize=(7.5, max(2.8, 0.42 * n + 1.2)), dpi=100)
+            fig = self.new_figure((7.6, 5.6))
             ax = fig.add_subplot(111)
             im = ax.imshow(corr.values, cmap="RdBu_r", vmin=-1, vmax=1)
-            ax.set_xticks(range(n), corr.columns, rotation=45,
-                          ha="right", fontsize=8)
-            ax.set_yticks(range(n), corr.index, fontsize=8)
-            for i in range(n):
-                for j in range(n):
-                    v = corr.values[i, j]
-                    ax.text(j, i, f"{v:.2f}", ha="center", va="center",
-                            fontsize=7,
-                            color="white" if abs(v) > 0.6 else "black")
+            step = max(1, int(np.ceil(n / 28)))
+            ticks = np.arange(0, n, step)
+            ax.set_xticks(ticks, corr.columns[ticks], rotation=45,
+                          ha="right", fontsize=7 if n > 30 else 8)
+            ax.set_yticks(ticks, corr.index[ticks], fontsize=7 if n > 30 else 8)
+            if n <= 20:
+                for i in range(n):
+                    for j in range(n):
+                        value = corr.values[i, j]
+                        ax.text(j, i, f"{value:.2f}", ha="center", va="center",
+                                fontsize=7,
+                                color="white" if abs(value) > 0.6 else "black")
+            ax.set_title(f"Return correlations ({n} assets"
+                         + (", clustered)" if clustered else ")"), fontsize=10)
             fig.colorbar(im, shrink=0.85)
-            fig.tight_layout()
+            annotation = ax.annotate(
+                "", xy=(0, 0), xytext=(10, 12), textcoords="offset points",
+                bbox={"boxstyle": "square,pad=0.35", "fc": "white",
+                      "ec": BORDER, "alpha": 0.96}, fontsize=8,
+                visible=False, zorder=10)
             for w_ in self.chart_corr.winfo_children():
                 w_.destroy()
-            self.embed_chart(fig, self.chart_corr)
+            canvas = self.embed_chart(fig, self.chart_corr, toolbar=True)
+            self._corr_df = corr
+            self._corr_ax = ax
+            self._corr_canvas = canvas
+            self._corr_search_artists = []
+
+            def hover(event):
+                if event.inaxes is not ax or event.xdata is None or event.ydata is None:
+                    annotation.set_visible(False)
+                    canvas.draw_idle()
+                    return
+                j, i = int(round(event.xdata)), int(round(event.ydata))
+                if not (0 <= i < n and 0 <= j < n):
+                    return
+                left_name, top_name = corr.index[i], corr.columns[j]
+                value = float(corr.iat[i, j])
+                annotation.xy = (j, i)
+                annotation.set_text(f"{left_name} / {top_name}\nCorrelation: {value:+.3f}")
+                annotation.set_visible(True)
+                self.var_corr_hover.set(
+                    f"{left_name} / {top_name}: correlation {value:+.3f}")
+                canvas.draw_idle()
+
+            canvas.mpl_connect("motion_notify_event", hover)
 
         self.run_async(work, done)
+
+    def _correlation_search(self):
+        if not hasattr(self, "_corr_df"):
+            return
+        names = [part.strip().upper() for part in
+                 self.var_corr_search.get().replace(",", " ").split() if part.strip()]
+        if not names:
+            return
+        missing = [name for name in names[:2] if name not in self._corr_df.index]
+        if missing:
+            self.var_corr_hover.set(f"Ticker not found: {missing[0]}")
+            return
+        for artist in self._corr_search_artists:
+            artist.remove()
+        self._corr_search_artists = []
+        indices = [self._corr_df.index.get_loc(name) for name in names[:2]]
+        if len(indices) == 1:
+            i = indices[0]
+            self._corr_search_artists.extend([
+                self._corr_ax.add_patch(Rectangle(
+                    (-0.5, i - 0.5), len(self._corr_df), 1, fill=False,
+                    ec="#111111", lw=1.8, zorder=8)),
+                self._corr_ax.add_patch(Rectangle(
+                    (i - 0.5, -0.5), 1, len(self._corr_df), fill=False,
+                    ec="#111111", lw=1.8, zorder=8)),
+            ])
+            self.var_corr_hover.set(f"Highlighted correlations for {names[0]}")
+        else:
+            i, j = indices
+            value = float(self._corr_df.iat[i, j])
+            for x, y in ((j, i), (i, j)):
+                self._corr_search_artists.append(self._corr_ax.add_patch(
+                    Rectangle((x - 0.5, y - 0.5), 1, 1, fill=False,
+                              ec="#111111", lw=2.2, zorder=8)))
+            self.var_corr_hover.set(
+                f"{names[0]} / {names[1]}: correlation {value:+.3f}")
+        self._corr_canvas.draw_idle()
 
     # ------------------------------------------------------- 3 health check
 
@@ -482,7 +881,7 @@ class Gui(tk.Tk):
             self.txt_flags.delete("1.0", "end")
             self.txt_flags.insert("1.0", "\n".join(f"- {f}" for f in flags))
 
-            fig = Figure(figsize=(7.5, 4.2), dpi=100)
+            fig = self.new_figure((7.5, 4.2))
             ax1 = fig.add_subplot(121)
             rc_plot = rc[rc["weight"] > 0].iloc[::-1]
             y = range(len(rc_plot))
@@ -513,7 +912,6 @@ class Gui(tk.Tk):
                        for l, c in REGIME_COLORS.items()]
             ax2.legend(handles=handles, fontsize=6, loc="upper left")
 
-            fig.tight_layout()
             for w_ in self.chart_health.winfo_children():
                 w_.destroy()
             self.embed_chart(fig, self.chart_health)
@@ -546,6 +944,10 @@ class Gui(tk.Tk):
                    command=lambda: self._opt_run(with_view=False)
                    ).pack(side="left")
         self.tree_opt = make_tree(self.content, height=8)
+        self.var_opt_hover = tk.StringVar(
+            value="Adaptive 80-120 point frontier with bootstrap input uncertainty.")
+        ttk.Label(self.content, textvariable=self.var_opt_hover,
+                  foreground=MUTED).pack(anchor="w", pady=(2, 0))
         self.chart_opt = ttk.Frame(self.content)
         self.chart_opt.pack(fill="both", expand=True)
         self._opt_run(with_view=False)
@@ -566,9 +968,17 @@ class Gui(tk.Tk):
             confidence = {"low": 0.15, "medium": 0.5, "high": 0.9}[
                 self.cb_bl_conf.get()]
 
-        def work():
+        def work(progress, cancel_event):
+            progress(0.01, "Preparing optimization inputs")
             s, prices, asset_returns, bench, last, snap, weights, value = \
                 self.backend.portfolio_context()
+            signature = self._calculation_signature(
+                prices, "optimization", tuple(sorted((view or {}).items())),
+                confidence)
+            cached = self._result_cache.get("optimization")
+            if cached is not None and cached[0] == signature:
+                progress(1.0, "Using cached optimization")
+                return cached[1]
             strategies, mu, cov = self.backend._target_strategies(asset_returns)
             if view:
                 unknown = [t for t in view if t not in cov.index]
@@ -587,25 +997,56 @@ class Gui(tk.Tk):
                     opt.weight_bounds(n, cap))
             alloc = pd.DataFrame(strategies)
             alloc["Current"] = weights.reindex(alloc.index).fillna(0.0)
-            frontier = opt.efficient_frontier(mu, cov, n_points=25)
-            cloud = opt.random_portfolios(mu, cov, n=2500)
+            n = len(mu)
+            cap = max(s["max_weight"], 1.0 / n + 0.01)
+            bounds = opt.weight_bounds(n, cap)
+            frontier_points = 120 if n <= 30 else 100 if n <= 100 else 80
+            frontier = opt.efficient_frontier(
+                mu, cov, n_points=frontier_points, bounds=bounds,
+                progress_callback=lambda f: progress(
+                    0.04 + 0.61 * f, "Computing constrained frontier"),
+                cancel_event=cancel_event)
+            progress(0.68, "Sampling feasible portfolios")
+            cloud = opt.random_portfolios(
+                mu, cov, n=2500, bounds=bounds)
+            n_boot = 30 if n <= 30 else 12 if n <= 100 else 6
+            band = opt.frontier_uncertainty_band(
+                asset_returns, frontier, n_boot=n_boot,
+                mean_shrinkage=0.5,
+                progress_callback=lambda f: progress(
+                    0.70 + 0.28 * f, "Bootstrapping uncertainty band"),
+                cancel_event=cancel_event)
             pts = {n: (opt.portfolio_volatility(w.values, cov),
                        opt.portfolio_return(w.values, mu))
                    for n, w in strategies.items()}
             wv = weights.reindex(mu.index).fillna(0.0).values
             pts["Current"] = (opt.portfolio_volatility(wv, cov),
-                              opt.portfolio_return(wv, mu))
-            return alloc.round(4), frontier, cloud, pts
+                               opt.portfolio_return(wv, mu))
+            progress(1.0, "Optimization ready")
+            result = (alloc.round(4), frontier, cloud, band, pts, cap,
+                      n_boot, frontier_points)
+            self._result_cache["optimization"] = (signature, result)
+            return result
 
         def done(payload):
-            alloc, frontier, cloud, pts = payload
+            if not self.chart_opt.winfo_exists():
+                return
+            (alloc, frontier, cloud, band, pts, cap, n_boot,
+             frontier_points) = payload
             df_to_tree(self.tree_opt, alloc.T, "strategy")
-            fig = Figure(figsize=(7.5, 3.8), dpi=100)
+            fig = self.new_figure((8.0, 4.6))
             ax = fig.add_subplot(111)
             ax.scatter(cloud["volatility"], cloud["return"], s=6, alpha=0.3,
                        color="#9db4c8")
-            ax.plot(frontier["volatility"], frontier["return"], color="crimson",
-                    lw=2, label="Efficient frontier")
+            order = np.argsort(frontier["volatility"].to_numpy())
+            band_ordered = band.iloc[order]
+            ax.fill_between(
+                band_ordered["volatility"], band_ordered["return_p10"],
+                band_ordered["return_p90"], color="#cf6679", alpha=0.16,
+                label=f"Bootstrap P10-P90 ({n_boot} resamples)")
+            frontier_line, = ax.plot(
+                frontier["volatility"], frontier["return"], color="crimson",
+                lw=2.2, label="Efficient frontier", picker=7)
             markers = {"Current": ("o", "black")}
             for name, (v, r) in pts.items():
                 mk, col = markers.get(name, ("D", None))
@@ -613,14 +1054,60 @@ class Gui(tk.Tk):
                            color=col, zorder=5, edgecolors="black")
             ax.set_xlabel("Annualized volatility")
             ax.set_ylabel("Expected annualized return")
+            ax.set_title(f"Constrained frontier | {frontier_points} targets | "
+                         f"{cap:.0%} max per asset",
+                         fontsize=10)
             ax.legend(fontsize=7)
             ax.grid(alpha=0.3)
-            fig.tight_layout()
+            focus, = ax.plot([], [], "o", ms=8, mfc="none", mec="black",
+                             mew=1.5, visible=False, zorder=9)
+            annotation = ax.annotate(
+                "", xy=(0, 0), xytext=(10, 12), textcoords="offset points",
+                bbox={"boxstyle": "square,pad=0.35", "fc": "white",
+                      "ec": BORDER, "alpha": 0.96}, fontsize=8,
+                visible=False, zorder=10)
             for w in self.chart_opt.winfo_children():
                 w.destroy()
-            self.embed_chart(fig, self.chart_opt)
+            canvas = self.embed_chart(fig, self.chart_opt, toolbar=True)
+            xy = np.column_stack((frontier["volatility"], frontier["return"]))
 
-        self.run_async(work, done, "Optimizing...")
+            def hover(event):
+                if event.inaxes is not ax:
+                    focus.set_visible(False)
+                    annotation.set_visible(False)
+                    canvas.draw_idle()
+                    return
+                display = ax.transData.transform(xy)
+                distance = np.hypot(display[:, 0] - event.x,
+                                    display[:, 1] - event.y)
+                idx = int(np.argmin(distance))
+                if distance[idx] > 14:
+                    focus.set_visible(False)
+                    annotation.set_visible(False)
+                    canvas.draw_idle()
+                    return
+                row = frontier.iloc[idx]
+                weights = pd.Series({
+                    col[2:]: row[col] for col in frontier.columns
+                    if col.startswith("w_")}).sort_values(ascending=False)
+                top = ", ".join(f"{name} {weight:.0%}"
+                                for name, weight in weights.head(5).items())
+                x, y = float(row["volatility"]), float(row["return"])
+                focus.set_data([x], [y])
+                focus.set_visible(True)
+                annotation.xy = (x, y)
+                annotation.set_text(
+                    f"Return {y:.2%} | Volatility {x:.2%}\n{top}")
+                annotation.set_visible(True)
+                self.var_opt_hover.set(
+                    f"Selected frontier portfolio: return {y:.2%}, "
+                    f"volatility {x:.2%} | {top}")
+                canvas.draw_idle()
+
+            canvas.mpl_connect("motion_notify_event", hover)
+
+        self.run_async(work, done, "Optimizing...", contextual=True,
+                       cancellable=True)
 
     # ---------------------------------------------------------- 5 rebalance
 
@@ -704,11 +1191,59 @@ class Gui(tk.Tk):
         self.e_horizon = ttk.Entry(row, width=6)
         self.e_horizon.insert(0, "3")
         self.e_horizon.pack(side="left", padx=4)
-        ttk.Button(row, text="Run simulation", command=self._projection_run
-                   ).pack(side="left", padx=8)
-        self.tree_mc = make_tree(self.content, height=10)
-        self.chart_mc = ttk.Frame(self.content)
+        self.btn_projection_run = ttk.Button(
+            row, text="Run simulation", command=self._projection_run)
+        self.btn_projection_run.pack(side="left", padx=8)
+        self.btn_projection_cancel = ttk.Button(
+            row, text="Cancel", command=lambda: self.cancel_task("compute"),
+            state="disabled")
+        self.btn_projection_cancel.pack(side="left")
+
+        progress_row = ttk.Frame(self.content)
+        progress_row.pack(fill="x", pady=(7, 4))
+        self.var_projection_progress = tk.DoubleVar(value=0.0)
+        ttk.Progressbar(progress_row, variable=self.var_projection_progress,
+                        maximum=100).pack(side="left", fill="x", expand=True)
+        self.var_projection_status = tk.StringVar(value="Ready")
+        ttk.Label(progress_row, textvariable=self.var_projection_status,
+                  width=34, anchor="e").pack(side="right", padx=(10, 0))
+
+        body = ttk.Panedwindow(self.content, orient="horizontal")
+        body.pack(fill="both", expand=True, pady=(4, 0))
+        left = ttk.Frame(body)
+        right = ttk.Frame(body, padding=(12, 0, 0, 0))
+        body.add(left, weight=4)
+        body.add(right, weight=2)
+        self.chart_mc = ttk.Frame(left)
         self.chart_mc.pack(fill="both", expand=True)
+
+        ttk.Label(right, text="Projection snapshot",
+                  font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        self._mc_stat_vars = {}
+        stats_grid = ttk.Frame(right)
+        stats_grid.pack(fill="x", pady=(6, 8))
+        stat_labels = [
+            ("P5 (pessimistic)", "p5"), ("Median", "median"),
+            ("P95 (optimistic)", "p95"), ("Probability of loss", "prob_loss"),
+            ("Horizon VaR 95%", "var"), ("Horizon CVaR 95%", "cvar"),
+            ("Minimum observed*", "minimum"), ("Maximum observed*", "maximum"),
+        ]
+        for i, (label, key) in enumerate(stat_labels):
+            ttk.Label(stats_grid, text=label).grid(row=i, column=0, sticky="w", pady=2)
+            variable = tk.StringVar(value="-")
+            self._mc_stat_vars[key] = variable
+            ttk.Label(stats_grid, textvariable=variable,
+                      font=("Segoe UI", 10, "bold")).grid(
+                          row=i, column=1, sticky="e", padx=(12, 0), pady=2)
+        stats_grid.columnconfigure(1, weight=1)
+        ttk.Label(right, text="*Raw extremes depend on the simulation sample.",
+                  foreground=MUTED, wraplength=310, justify="left").pack(anchor="w")
+        ttk.Separator(right, orient="horizontal").pack(fill="x", pady=8)
+        self.var_mc_hover = tk.StringVar(
+            value="Move the pointer over a trajectory to inspect it.")
+        ttk.Label(right, textvariable=self.var_mc_hover, foreground=MUTED,
+                  wraplength=310, justify="left").pack(anchor="w", pady=(0, 6))
+        self.tree_mc = make_tree(right, height=10)
 
     def _projection_run(self):
         try:
@@ -716,43 +1251,167 @@ class Gui(tk.Tk):
         except ValueError:
             years = 3.0
 
-        def work():
+        if years <= 0 or years > 50:
+            messagebox.showwarning("LFT", "Horizon must be between 0 and 50 years.")
+            return
+        started = time.perf_counter()
+
+        def work(progress, cancel_event):
+            progress(0.01, "Preparing portfolio inputs")
             s, prices, asset_returns, bench, last, snap, weights, value = \
                 self.backend.portfolio_context()
+            signature = self._calculation_signature(
+                prices, "projection", years)
+            cached = self._result_cache.get("projection")
+            if cached is not None and cached[0] == signature:
+                progress(1.0, "Using cached projection")
+                return cached[1]
             w = weights.reindex(asset_returns.columns).fillna(0.0)
             horizon = int(years * 252)
             rf = s["risk_free"]; fee = s.get("fee_annual", 0.005); infl = s.get("inflation", 0.025)
             gbm = mc.simulate_gbm(asset_returns, w, value, horizon, n_sims=20000,
-                                  risk_free=rf, cost_annual=fee, inflation=infl)
+                                  risk_free=rf, cost_annual=fee, inflation=infl,
+                                  progress_callback=lambda f, m: progress(
+                                      0.03 + 0.55 * f, m),
+                                  cancel_event=cancel_event)
             boot = mc.simulate_bootstrap(asset_returns, w, value, horizon, n_sims=20000,
-                                         risk_free=rf, cost_annual=fee, inflation=infl)
+                                         risk_free=rf, cost_annual=fee, inflation=infl,
+                                         progress_callback=lambda f, m: progress(
+                                             0.58 + 0.36 * f, m),
+                                         cancel_event=cancel_event)
+            progress(0.96, "Computing percentiles and representative paths")
             summary = pd.concat([gbm.summary(), boot.summary()], axis=1)
             summary.columns = ["GBM", "Bootstrap"]
-            import numpy as np
             days = np.arange(gbm.paths.shape[0])
             bands = {p: np.percentile(gbm.paths, p, axis=1) for p in (5, 50, 95)}
-            return summary, days, bands, value
+            order = np.argsort(gbm.paths[-1])
+            positions = np.linspace(0, len(order) - 1,
+                                    min(160, len(order)), dtype=int)
+            chosen = order[positions]
+            representative = gbm.paths[:, chosen]
+            path_percentiles = 100 * positions / max(len(order) - 1, 1)
+            detail = {
+                "p5": gbm.percentiles[5], "median": gbm.percentiles[50],
+                "p95": gbm.percentiles[95], "prob_loss": gbm.prob_loss(),
+                "var": gbm.var(), "cvar": gbm.cvar(),
+                "minimum": float(gbm.terminal_values.min()),
+                "maximum": float(gbm.terminal_values.max()),
+            }
+            progress(1.0, "Projection ready")
+            result = (summary, days, bands, value, representative,
+                      path_percentiles, detail)
+            self._result_cache["projection"] = (signature, result)
+            return result
 
         def done(payload):
-            summary, days, bands, value = payload
+            if not self.chart_mc.winfo_exists():
+                return
+            summary, days, bands, value, paths, path_percentiles, detail = payload
             df_to_tree(self.tree_mc, summary, "measure")
-            fig = Figure(figsize=(7.5, 3.4), dpi=100)
+            for key in ("p5", "median", "p95", "minimum", "maximum"):
+                self._mc_stat_vars[key].set(f"{detail[key]:,.0f}")
+            for key in ("prob_loss", "var", "cvar"):
+                self._mc_stat_vars[key].set(f"{detail[key]:.1%}")
+
+            fig = self.new_figure((8.0, 4.7))
             ax = fig.add_subplot(111)
-            ax.fill_between(days, bands[5], bands[95], alpha=0.15, color="#2a78d6")
-            ax.plot(days, bands[50], color="#2a78d6", lw=2, label="Median")
-            ax.plot(days, bands[5], color="#2a78d6", lw=1, ls=":", label="P5 / P95")
-            ax.plot(days, bands[95], color="#2a78d6", lw=1, ls=":")
+            segments = np.stack([
+                np.column_stack((days, paths[:, i])) for i in range(paths.shape[1])])
+            collection = LineCollection(segments, colors="#71879f",
+                                        linewidths=0.55, alpha=0.20, zorder=1)
+            ax.add_collection(collection)
+            ax.fill_between(days, bands[5], bands[95], alpha=0.12,
+                            color=ACCENT, label="P5-P95 range", zorder=2)
+            ax.plot(days, bands[50], color=ACCENT, lw=2.2, label="Median", zorder=4)
+            ax.plot(days, bands[5], color=ACCENT, lw=1, ls=":", zorder=3)
+            ax.plot(days, bands[95], color=ACCENT, lw=1, ls=":", zorder=3)
             ax.axhline(value, color="black", lw=1, ls="--")
+            ax.set_xlim(days[0], days[-1])
+            low = min(float(paths.min()), float(bands[5].min()), value)
+            high = max(float(paths.max()), float(bands[95].max()), value)
+            pad = max((high - low) * 0.04, 1.0)
+            ax.set_ylim(low - pad, high + pad)
             ax.set_xlabel("Trading days")
             ax.set_ylabel("Portfolio value")
             ax.grid(alpha=0.3)
             ax.legend(fontsize=8)
-            fig.tight_layout()
+            highlight, = ax.plot([], [], color="#d43f3a", lw=2.1,
+                                 zorder=8, visible=False)
+            annotation = ax.annotate(
+                "", xy=(0, 0), xytext=(10, 12), textcoords="offset points",
+                bbox={"boxstyle": "square,pad=0.35", "fc": "white",
+                      "ec": BORDER, "alpha": 0.96},
+                arrowprops={"arrowstyle": "-", "color": BORDER},
+                fontsize=8, visible=False, zorder=10)
             for w in self.chart_mc.winfo_children():
                 w.destroy()
-            self.embed_chart(fig, self.chart_mc)
+            canvas = self.embed_chart(fig, self.chart_mc, toolbar=True)
 
-        self.run_async(work, done, "Simulating 40,000 realistic paths...")
+            def hover(event):
+                if event.inaxes is not ax or event.xdata is None or event.ydata is None:
+                    highlight.set_visible(False)
+                    annotation.set_visible(False)
+                    canvas.draw_idle()
+                    return
+                day = int(np.clip(round(event.xdata), 0, len(days) - 1))
+                values = paths[day]
+                selected = int(np.argmin(np.abs(values - event.ydata)))
+                if abs(values[selected] - event.ydata) > 0.055 * (high - low):
+                    highlight.set_visible(False)
+                    annotation.set_visible(False)
+                    canvas.draw_idle()
+                    return
+                path = paths[:, selected]
+                terminal = float(path[-1])
+                cagr = (terminal / value) ** (252 / max(days[-1], 1)) - 1
+                percentile = path_percentiles[selected]
+                highlight.set_data(days, path)
+                highlight.set_visible(True)
+                annotation.xy = (day, path[day])
+                annotation.set_text(
+                    f"Path percentile: {percentile:.0f}%\n"
+                    f"Day {day}: {path[day]:,.0f}\n"
+                    f"Terminal: {terminal:,.0f} | CAGR {cagr:.1%}")
+                annotation.set_visible(True)
+                self.var_mc_hover.set(
+                    f"Selected trajectory: percentile {percentile:.0f}% | "
+                    f"terminal value {terminal:,.0f} | CAGR {cagr:.1%}")
+                canvas.draw_idle()
+
+            canvas.mpl_connect("motion_notify_event", hover)
+            self.var_projection_progress.set(100)
+            self.var_projection_status.set(
+                f"Completed in {time.perf_counter() - started:.1f}s")
+            self.btn_projection_run.configure(state="normal")
+            self.btn_projection_cancel.configure(state="disabled")
+
+        def on_progress(fraction, message, eta):
+            if (hasattr(self, "btn_projection_run") and
+                    self.btn_projection_run.winfo_exists()):
+                self.var_projection_progress.set(fraction * 100)
+                eta_text = f" | ~{eta:.0f}s left" if eta is not None else ""
+                self.var_projection_status.set(f"{message}{eta_text}")
+
+        def on_cancel():
+            if hasattr(self, "btn_projection_run") and self.btn_projection_run.winfo_exists():
+                self.btn_projection_run.configure(state="normal")
+                self.btn_projection_cancel.configure(state="disabled")
+                self.var_projection_status.set("Cancelled")
+
+        def on_error(_error):
+            if hasattr(self, "btn_projection_run") and self.btn_projection_run.winfo_exists():
+                self.btn_projection_run.configure(state="normal")
+                self.btn_projection_cancel.configure(state="disabled")
+                self.var_projection_status.set("Failed")
+
+        self.btn_projection_run.configure(state="disabled")
+        self.btn_projection_cancel.configure(state="normal")
+        token = self.run_async(
+            work, done, "Simulating 40,000 realistic paths...",
+            contextual=True, cancellable=True, on_progress=on_progress,
+            on_cancel=on_cancel, on_error=on_error)
+        if token is None:
+            on_cancel()
 
     # ----------------------------------------------------------- 7 backtest
 
@@ -762,16 +1421,41 @@ class Gui(tk.Tk):
         ttk.Label(self.content,
                   text="Honest walk-forward comparison on your tickers "
                        "(can take 30-60 seconds).").pack(anchor="w")
-        ttk.Button(self.content, text="Run backtest",
-                   command=self._backtest_run).pack(anchor="w", pady=4)
+        controls = ttk.Frame(self.content)
+        controls.pack(fill="x", pady=4)
+        self.btn_backtest_run = ttk.Button(
+            controls, text="Run backtest", command=self._backtest_run)
+        self.btn_backtest_run.pack(side="left")
+        self.btn_backtest_cancel = ttk.Button(
+            controls, text="Cancel", command=lambda: self.cancel_task("compute"),
+            state="disabled")
+        self.btn_backtest_cancel.pack(side="left", padx=8)
+        self.var_backtest_progress = tk.DoubleVar(value=0.0)
+        ttk.Progressbar(controls, variable=self.var_backtest_progress,
+                        maximum=100).pack(side="left", fill="x", expand=True, padx=8)
+        self.var_backtest_status = tk.StringVar(value="Ready")
+        ttk.Label(controls, textvariable=self.var_backtest_status,
+                  width=28, anchor="e").pack(side="right")
         self.tree_bt = make_tree(self.content, height=6)
+        self.var_bt_hover = tk.StringVar(
+            value="Move the pointer over a strategy curve to inspect a date.")
+        ttk.Label(self.content, textvariable=self.var_bt_hover,
+                  foreground=MUTED).pack(anchor="w", pady=(2, 0))
         self.chart_bt = ttk.Frame(self.content)
         self.chart_bt.pack(fill="both", expand=True)
 
     def _backtest_run(self):
-        def work():
+        started = time.perf_counter()
+
+        def work(progress, cancel_event):
+            progress(0.01, "Preparing walk-forward inputs")
             s, prices, asset_returns, bench, last, snap, weights, value = \
                 self.backend.portfolio_context()
+            signature = self._calculation_signature(prices, "backtest")
+            cached = self._result_cache.get("backtest")
+            if cached is not None and cached[0] == signature:
+                progress(1.0, "Using cached backtest")
+                return cached[1]
             held = list(asset_returns.columns)
             cap = max(s["max_weight"], 1 / len(held) + 0.01)
             strategies = {
@@ -781,31 +1465,119 @@ class Gui(tk.Tk):
             }
             curves, _ = wf.compare_walk_forward(prices[held], strategies,
                                                 lookback=s["lookback"],
-                                                tc_bps=s["tc_bps"])
+                                                tc_bps=s["tc_bps"],
+                                                progress_callback=lambda f, m: progress(
+                                                    0.03 + 0.90 * f, m),
+                                                cancel_event=cancel_event)
+            progress(0.95, "Computing benchmark statistics")
             curves[s["benchmark"]] = (10_000 * (1 + bench.reindex(curves.index))
                                       .cumprod())
             stats = metrics.summary(curves.pct_change().dropna(),
                                     bench.reindex(curves.index), s["risk_free"])
             rows = ["CAGR", "Annualized volatility", "Sharpe", "Max drawdown", "Calmar"]
-            return stats.loc[rows].round(4), curves
+            progress(1.0, "Backtest ready")
+            result = (stats.loc[rows].round(4), curves)
+            self._result_cache["backtest"] = (signature, result)
+            return result
 
         def done(payload):
+            if not self.chart_bt.winfo_exists():
+                return
             stats, curves = payload
             df_to_tree(self.tree_bt, stats, "metric")
-            fig = Figure(figsize=(7.5, 3.4), dpi=100)
+            fig = self.new_figure((8.0, 4.1))
             ax = fig.add_subplot(111)
+            lines = {}
             for col in curves.columns:
-                ax.plot(curves.index, curves[col], lw=1.3, label=col)
+                line, = ax.plot(curves.index, curves[col], lw=1.4, label=col)
+                lines[col] = line
             ax.set_yscale("log")
             ax.set_ylabel("Value (log scale)")
             ax.legend(fontsize=7)
             ax.grid(alpha=0.3)
-            fig.tight_layout()
+            annotation = ax.annotate(
+                "", xy=(0, 0), xytext=(10, 12), textcoords="offset points",
+                bbox={"boxstyle": "square,pad=0.35", "fc": "white",
+                      "ec": BORDER, "alpha": 0.96}, fontsize=8,
+                visible=False, zorder=10)
             for w in self.chart_bt.winfo_children():
                 w.destroy()
-            self.embed_chart(fig, self.chart_bt)
+            canvas = self.embed_chart(fig, self.chart_bt, toolbar=True)
+            dates_num = mdates.date2num(curves.index.to_pydatetime())
 
-        self.run_async(work, done, "Running walk-forward backtest (be patient)...")
+            def hover(event):
+                if (event.inaxes is not ax or event.xdata is None or
+                        event.ydata is None or event.ydata <= 0):
+                    annotation.set_visible(False)
+                    for line in lines.values():
+                        line.set_linewidth(1.4)
+                        line.set_alpha(1.0)
+                    canvas.draw_idle()
+                    return
+                idx = int(np.clip(np.searchsorted(dates_num, event.xdata),
+                                  0, len(dates_num) - 1))
+                if idx > 0 and abs(dates_num[idx - 1] - event.xdata) < abs(
+                        dates_num[idx] - event.xdata):
+                    idx -= 1
+                values = curves.iloc[idx].dropna()
+                if values.empty:
+                    return
+                distances = np.abs(np.log(values.values) - np.log(event.ydata))
+                selected = values.index[int(np.argmin(distances))]
+                value_at_date = float(values[selected])
+                if float(np.min(distances)) > 0.16:
+                    annotation.set_visible(False)
+                    canvas.draw_idle()
+                    return
+                for name, line in lines.items():
+                    line.set_linewidth(2.6 if name == selected else 1.0)
+                    line.set_alpha(1.0 if name == selected else 0.32)
+                first = float(curves[selected].dropna().iloc[0])
+                total_return = value_at_date / first - 1
+                date = curves.index[idx]
+                annotation.xy = (date, value_at_date)
+                annotation.set_text(
+                    f"{selected}\n{date:%Y-%m-%d}\n"
+                    f"Value: {value_at_date:,.0f} | Return: {total_return:.1%}")
+                annotation.set_visible(True)
+                self.var_bt_hover.set(
+                    f"{selected} | {date:%Y-%m-%d} | value {value_at_date:,.0f} | "
+                    f"return since inception {total_return:.1%}")
+                canvas.draw_idle()
+
+            canvas.mpl_connect("motion_notify_event", hover)
+            self.var_backtest_progress.set(100)
+            self.var_backtest_status.set(
+                f"Completed in {time.perf_counter() - started:.1f}s")
+            self.btn_backtest_run.configure(state="normal")
+            self.btn_backtest_cancel.configure(state="disabled")
+
+        def on_progress(fraction, message, eta):
+            if hasattr(self, "btn_backtest_run") and self.btn_backtest_run.winfo_exists():
+                self.var_backtest_progress.set(fraction * 100)
+                eta_text = f" | ~{eta:.0f}s left" if eta is not None else ""
+                self.var_backtest_status.set(f"{message}{eta_text}")
+
+        def on_cancel():
+            if hasattr(self, "btn_backtest_run") and self.btn_backtest_run.winfo_exists():
+                self.btn_backtest_run.configure(state="normal")
+                self.btn_backtest_cancel.configure(state="disabled")
+                self.var_backtest_status.set("Cancelled")
+
+        def on_error(_error):
+            if hasattr(self, "btn_backtest_run") and self.btn_backtest_run.winfo_exists():
+                self.btn_backtest_run.configure(state="normal")
+                self.btn_backtest_cancel.configure(state="disabled")
+                self.var_backtest_status.set("Failed")
+
+        self.btn_backtest_run.configure(state="disabled")
+        self.btn_backtest_cancel.configure(state="normal")
+        token = self.run_async(
+            work, done, "Running walk-forward backtest...", contextual=True,
+            cancellable=True, on_progress=on_progress, on_cancel=on_cancel,
+            on_error=on_error)
+        if token is None:
+            on_cancel()
 
     # ---------------------------------------------------------- performance
 
@@ -855,9 +1627,9 @@ class Gui(tk.Tk):
         def work():
             tx = perf.load_transactions_csv(path)
             tickers = sorted(tx["ticker"].unique())
-            s = self.backend.state["settings"]
+            start, end = self.backend.analysis_dates()
             prices, source = self.backend.store.get_prices(
-                tickers, s["start"], s["end"])
+                tickers, start, end)
             last = prices.iloc[-1]
             summary = perf.performance_summary(tx, last)
             pnl = perf.pnl_report(tx, last)
@@ -1049,7 +1821,8 @@ class Gui(tk.Tk):
             self.after_idle(lambda: self.status.set("IBKR sync complete."))
 
         self.run_async(work, done,
-                       f"Connecting to IBKR on {endpoint} (read-only)...")
+                       f"Connecting to IBKR on {endpoint} (read-only)...",
+                       channel="ibkr")
 
     # ----------------------------------------------------------- settings
 
@@ -1068,7 +1841,7 @@ class Gui(tk.Tk):
                    ).grid(row=len(s), column=1, pady=10, sticky="e")
         ttk.Label(self.content, foreground="#666", justify="left", text=(
             "benchmark: comparison index (e.g. SPY)\n"
-            "start / end: analysis period (YYYY-MM-DD)\n"
+            "start / end: analysis period (YYYY-MM-DD; end may be 'today')\n"
             "risk_free: annual risk-free rate (0.03 = 3%)\n"
             "tc_bps: transaction costs in basis points\n"
             "lookback: walk-forward estimation window (trading days)\n"
@@ -1078,7 +1851,8 @@ class Gui(tk.Tk):
     def _settings_save(self):
         s = self.backend.state["settings"]
         casts = {"benchmark": str, "start": str, "end": str,
-                 "risk_free": float, "tc_bps": float, "lookback": int,
+                 "risk_free": float, "tc_bps": float,
+                 "fee_annual": float, "inflation": float, "lookback": int,
                  "max_weight": float, "ibkr_host": str, "ibkr_port": int,
                  "ibkr_client_id": int, "ibkr_autosync": int,
                  "ibkr_watch_minutes": int}
@@ -1096,4 +1870,5 @@ class Gui(tk.Tk):
 
 
 if __name__ == "__main__":
+    enable_windows_dpi_awareness()
     Gui().mainloop()

@@ -1,102 +1,163 @@
-# LFT — Quantitative portfolio analysis
+# LFT - LeFort - Portfolio Management
 
-Python quantitative-finance toolkit: modern portfolio theory, CAPM, Fama-French, Monte Carlo, honest walk-forward backtesting, SQLite data store, and AI-powered explanations. First building block of a future full-stack AI investment assistant.
+LFT is a Windows desktop application for portfolio analysis, risk diagnostics,
+optimization, projection and walk-forward backtesting. It is an educational
+decision-support tool: it reads portfolios and market data, but never sends an
+order to a broker.
 
-## Quick start
+## Windows quick start
 
-```bash
-pip install -r requirements.txt
-python gui.py                     # THE APP: real window (or double-click LFT.bat)
-python app.py                     # same software, console edition
-python main.py                    # full pedagogical pipeline (8 steps)
-python demo_walkforward.py        # honest backtest + SQLite cache
+From PowerShell in the project directory:
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\LFT.bat
 ```
 
-### The app (`gui.py` / `LFT.bat`)
+`LFT.bat` automatically uses `.venv` when it exists. The equivalent manual
+command is:
 
-A real desktop application in its own window: sidebar navigation, nine
-pages (Portfolio, Market data, Health check, Optimization, Rebalance,
-Projection, Backtest, AI analyst, Settings), data-entry forms, tables and
-charts embedded in the window. On Windows, double-click `LFT.bat`
-to launch it without a terminal. `app.py` is the same software as a
-console app; both share the same engine and the same saved state
-(`app_state.json`), so you can switch freely.
-
-### IBKR connection (read-only)
-
-The app can import your real Interactive Brokers positions. One-time setup
-in Trader Workstation: File > Global Configuration > API > Settings, check
-"Enable ActiveX and Socket Clients" and "Read-Only API", note the socket
-port (7497 paper / 7496 live). Keep TWS running, then use page 1 > `i`.
-The connection is opened read-only: this software can never place an order.
-Rebalancing proposals (page 5) are tables you review and execute yourself.
-
-The pipeline loads real prices via **yfinance** (or realistic synthetic data when offline), analyzes a 9-asset portfolio against the S&P 500 (SPY), and produces tables + charts in `output/`.
-
-Windows note: if the console garbles special characters, run with `set PYTHONIOENCODING=utf-8` (all console output is plain ASCII by design, so this should rarely be needed).
-
-For the AI explanation via the Claude API (optional):
-
-```bash
-export ANTHROPIC_API_KEY="sk-..."   # Windows: set ANTHROPIC_API_KEY=sk-...
+```powershell
+.\.venv\Scripts\python.exe gui.py
 ```
 
-Without a key, an offline rule engine interprets the metrics.
+The console edition uses the same saved portfolio and engine:
 
-## Structure
-
+```powershell
+.\.venv\Scripts\python.exe app.py
 ```
+
+## Jupyter notebook edition
+
+`LFT_Analysis.ipynb` runs the full quantitative pipeline step by step
+(data, metrics, health check, CAPM / Fama-French, Markowitz optimization,
+in-sample backtest, walk-forward backtest, Monte Carlo projection, market
+regimes and the long-form AI analyst report). It reuses the same engine
+and the same local SQLite price cache as the app.
+
+One-time setup (adds the Jupyter tooling to the same venv):
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-notebook.txt
+.\.venv\Scripts\python.exe -m ipykernel install --user --name lft-venv --display-name "Python (LFT venv)"
+```
+
+Then launch and select the **Python (LFT venv)** kernel:
+
+```powershell
+.\.venv\Scripts\python.exe -m jupyter notebook LFT_Analysis.ipynb
+```
+
+Edit the *Configuration* cell (your tickers and share counts), then
+*Run All*. Without internet the notebook automatically switches to clearly
+flagged synthetic data; charts are both displayed inline and saved to
+`output/`.
+
+## Main capabilities
+
+- Portfolio entry, CSV import and read-only Interactive Brokers sync.
+- Daily performance, risk statistics and data provenance.
+- Correlation heatmap with clustering, zoom, hover, ticker search and strongest
+  pair ranking; designed to remain usable with up to 200 assets.
+- Health checks, concentration diagnostics, regime analysis and risk
+  contributions.
+- Max-Sharpe, minimum-volatility, risk-parity, equal-weight and
+  Black-Litterman allocations.
+- Adaptive 80 to 120 point efficient frontier with consistent weight caps and
+  a block-bootstrap uncertainty band.
+- Monte Carlo projection using 20,000 covariance-aware GBM scenarios plus
+  20,000 historical block-bootstrap scenarios. The chart displays 160
+  representative trajectories with hover inspection, P5/P50/P95, probability
+  of loss, VaR, CVaR and observed extremes.
+- Walk-forward strategy backtests with no look-ahead, transaction costs,
+  progress, cancellation and interactive curve inspection.
+- Personal performance from transaction CSV files, including XIRR and
+  realized/unrealized P&L.
+- Long-form AI analysis (10-section report: executive summary, performance,
+  risk, diversification, scenarios, strengths, weaknesses, action plan,
+  monitoring checklist, glossary) through `ANTHROPIC_API_KEY`; a detailed
+  offline rules engine (~1,500 words) remains available without a key.
+
+Windows per-monitor DPI awareness is enabled before Tkinter starts. Tk widgets
+and Matplotlib figures use the screen's actual DPI instead of being enlarged as
+blurry bitmaps by Windows.
+
+## Interactive Brokers connection
+
+LFT only imports positions and cash. It cannot place orders.
+
+1. Open Trader Workstation or IB Gateway and sign in.
+2. Use a paper-trading account for testing.
+3. In TWS, open `File > Global Configuration > API > Settings`.
+4. Enable `ActiveX and Socket Clients` and keep `Read-Only API` enabled.
+5. Use port `7497` for TWS paper trading or `7496` for TWS live trading.
+6. Keep TWS open, then open `IBKR connection` in LFT.
+7. Select Paper, verify host `127.0.0.1`, choose a unique client ID, and click
+   `Connect and sync now`.
+
+The IBKR task has its own worker channel. A failed or slow broker connection no
+longer blocks portfolio calculations.
+
+## Data layer
+
+The local SQLite v3 store keeps:
+
+- raw and adjusted daily OHLCV prices;
+- source and ingestion timestamp for each price row;
+- dividends and stock splits in a separate corporate-actions table;
+- a lightweight instrument master;
+- macro series, quality flags and a fetch audit log.
+
+Downloads are incremental, cached periods are reused, and the requested end
+date can be `today`. The current free market source is yfinance. It is useful
+for research and personal projects, but is not an institutional data guarantee.
+Synthetic fallback data is clearly identified and is never written into the
+real-price cache.
+
+For a future professional data layer, source adapters can be added without
+changing the analytics API. Point-in-time fundamentals, delisted securities,
+exchange calendars, currencies and independent data reconciliation remain
+separate future work.
+
+## Project structure
+
+```text
+app.py                    Shared backend and console application
+gui.py                    Tkinter desktop interface
+LFT.bat                   Windows launcher
 quantfolio/
-├── data.py          Prices (yfinance + synthetic generator), returns
-├── metrics.py       CAGR, volatility, Sharpe, Sortino, Calmar, drawdown,
-│                    VaR (historical/Gaussian/Cornish-Fisher), CVaR,
-│                    alpha, beta, tracking error, information ratio
-├── capm.py          CAPM regression (OLS), market risk premium
-├── factors.py       Fama-French 3 and 5 factors (Ken French or synthetic)
-├── optimization.py  Markowitz: efficient frontier, MaxSharpe, MinVol,
-│                    Risk Parity, equal weight, inverse volatility,
-│                    Ledoit-Wolf shrinkage covariance, weight caps
-├── montecarlo.py    Correlated GBM (Cholesky) + block bootstrap
-├── backtest.py      Periodic rebalancing, transaction costs
-├── walkforward.py   Walk-forward backtest (no look-ahead)
-├── store.py         Incremental SQLite price cache
-├── ai_analyst.py    Plain-English explanation (Claude API + offline rules)
-└── report.py        Charts (frontier, correlations, Monte Carlo...)
-
-docs/THEORY.md       Full theory guide
-main.py              Demo pipeline (8 steps, in-sample for teaching)
-demo_walkforward.py  Honest out-of-sample comparison
-tests/               35 consistency checks
+  advisor.py              Health checks and rebalance proposals
+  backtest.py             Fixed-weight backtesting
+  broker.py               CSV and read-only IBKR portfolio import
+  capm.py / factors.py    CAPM and factor models
+  data.py                 Price loading and synthetic test data
+  metrics.py              Return and risk statistics
+  montecarlo.py           GBM and block-bootstrap projections
+  optimization.py         Portfolio optimizers and efficient frontier
+  performance.py          Transaction-level P&L and XIRR
+  regime.py               Market-regime diagnostics
+  store.py                SQLite v3 data and provenance layer
+  walkforward.py          Out-of-sample walk-forward engine
+tests/                    Executable consistency and regression checks
 ```
 
-## Library usage
+## Verification
 
-```python
-from quantfolio import data, metrics, optimization as opt
+Each test file is directly executable. To run the complete suite in
+PowerShell:
 
-prices, _ = data.load_prices(["AAPL", "MSFT", "TLT"], "2021-01-01", "2025-06-30")
-returns = data.to_returns(prices)
-
-print(metrics.summary(returns, risk_free_rate=0.03))
-
-mu, cov = opt.annualized_inputs(returns, shrinkage=True)  # Ledoit-Wolf
-print(opt.max_sharpe_weights(mu, cov, risk_free_rate=0.03))
+```powershell
+Get-ChildItem tests\test_*.py | ForEach-Object {
+    .\.venv\Scripts\python.exe $_.FullName
+}
 ```
 
-## Customization
-
-Edit the `config` block at the top of `main.py`: tickers, benchmark, period, risk-free rate, initial capital.
-
-## Roadmap (toward the final product)
-
-1. **Done**: quant engine (MPT, CAPM, FF, Monte Carlo, backtest) + AI analyst
-2. **Done**: robustness — walk-forward, Ledoit-Wolf, weight caps, SQLite store
-3. Macro data (FRED: inflation, rates) and real Fama-French factors
-4. Interactive dashboard (Streamlit)
-5. IBKR connection (read-only, via ib_async / Flex Queries)
-6. API backend (FastAPI) + web interface — the final product
-7. Advanced quant: Black-Litterman, Hierarchical Risk Parity, GARCH, CVaR optimization
+The current suite contains 121 checks covering mathematical identities,
+optimization constraints, Monte Carlo guardrails, cancellation, walk-forward
+anti-look-ahead behavior, broker imports and SQLite migrations.
 
 ## Disclaimer
 
-Educational project. Nothing here is investment advice.
+Educational project. Nothing produced by LFT is investment advice, a forecast
+guarantee or an instruction to trade.

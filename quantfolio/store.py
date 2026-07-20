@@ -1,8 +1,10 @@
 """
-Local data store (SQLite) v2 - the project's data backbone.
+Local data store (SQLite) v3 - the project's data backbone.
 
 What it stores (one file, quantfolio_prices.db):
-    prices        OHLCV daily bars per ticker (close is what the engine uses)
+    prices        raw and adjusted OHLCV bars with source and ingestion time
+    corporate_actions  dividends and stock splits kept separately
+    instruments   lightweight security master (symbol, currency, venue, source)
     macro         FRED macro series (CPI, rates...) for real returns & context
     quality_flags suspicious data points detected on write (e.g. 60%+ jumps)
     fetch_log     audit trail of every download (when, what, how many rows)
@@ -43,9 +45,9 @@ import pandas as pd
 
 from . import data as data_mod
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
-_SCHEMA_V2 = """
+_SCHEMA_V3 = """
 CREATE TABLE IF NOT EXISTS prices (
     ticker TEXT NOT NULL,
     date   TEXT NOT NULL,
@@ -54,6 +56,10 @@ CREATE TABLE IF NOT EXISTS prices (
     low    REAL,
     close  REAL NOT NULL,
     volume REAL,
+    raw_close REAL,
+    adjusted_close REAL,
+    source TEXT,
+    ingested_at TEXT,
     PRIMARY KEY (ticker, date)
 );
 CREATE INDEX IF NOT EXISTS idx_prices_ticker ON prices (ticker);
@@ -83,6 +89,26 @@ CREATE TABLE IF NOT EXISTS fetch_log (
     end       TEXT,
     rows      INTEGER,
     status    TEXT
+);
+
+CREATE TABLE IF NOT EXISTS corporate_actions (
+    ticker      TEXT NOT NULL,
+    date        TEXT NOT NULL,
+    action      TEXT NOT NULL,
+    value       REAL NOT NULL,
+    source      TEXT,
+    ingested_at TEXT,
+    PRIMARY KEY (ticker, date, action)
+);
+
+CREATE TABLE IF NOT EXISTS instruments (
+    ticker      TEXT PRIMARY KEY,
+    exchange    TEXT,
+    currency    TEXT,
+    timezone    TEXT,
+    active      INTEGER NOT NULL DEFAULT 1,
+    source      TEXT,
+    updated_at  TEXT
 );
 """
 
@@ -141,7 +167,7 @@ class PriceStore:
         return sqlite3.connect(self.db_path)
 
     def _migrate(self, con: sqlite3.Connection):
-        """Create the v2 schema; upgrade a v1 (close-only) DB in place."""
+        """Create the v3 schema and preserve every earlier database in place."""
         version = con.execute("PRAGMA user_version").fetchone()[0]
         if version >= SCHEMA_VERSION:
             return
@@ -150,9 +176,21 @@ class PriceStore:
         ).fetchone()
         if has_prices:
             cols = {row[1] for row in con.execute("PRAGMA table_info(prices)")}
-            for missing in {"open", "high", "low", "volume"} - cols:
-                con.execute(f"ALTER TABLE prices ADD COLUMN {missing} REAL")
-        con.executescript(_SCHEMA_V2)
+            definitions = {
+                "open": "REAL", "high": "REAL", "low": "REAL",
+                "volume": "REAL", "raw_close": "REAL",
+                "adjusted_close": "REAL", "source": "TEXT",
+                "ingested_at": "TEXT",
+            }
+            for missing in definitions.keys() - cols:
+                con.execute(
+                    f"ALTER TABLE prices ADD COLUMN {missing} {definitions[missing]}")
+        con.executescript(_SCHEMA_V3)
+        con.execute(
+            "UPDATE prices SET adjusted_close=close "
+            "WHERE adjusted_close IS NULL")
+        con.execute(
+            "UPDATE prices SET source='legacy_yfinance' WHERE source IS NULL")
         con.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def _log(self, kind: str, items: list[str], start, end, rows: int, status: str):
@@ -167,42 +205,67 @@ class PriceStore:
     # ---- price download (default path fetches full OHLCV via yfinance)
 
     def _download(self, tickers: list[str], start: str, end: str):
-        """Returns (close_wide, ohlcv_long_rows or None)."""
+        """Returns adjusted closes, price rows, actions and instruments."""
+        ingested_at = _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")
         if self._custom_downloader is not None:
-            close, _ = self._custom_downloader(tickers, start, end)
-            return close, None
+            close, source = self._custom_downloader(tickers, start, end)
+            instruments = [(tk, None, None, None, 1, source, ingested_at)
+                           for tk in tickers]
+            return close, None, [], instruments
         import yfinance as yf
-        raw = yf.download(tickers, start=start, end=end,
-                          progress=False, auto_adjust=True, group_by="column")
+        # yfinance treats `end` as exclusive while the store API is inclusive.
+        download_end = (pd.Timestamp(end) + pd.Timedelta(days=1)).date().isoformat()
+        raw = yf.download(tickers, start=start, end=download_end,
+                          progress=False, auto_adjust=False, actions=True,
+                          group_by="column")
         if raw.empty:
             raise ValueError("yfinance returned no data")
         if not isinstance(raw.columns, pd.MultiIndex):   # single ticker
             raw.columns = pd.MultiIndex.from_product([raw.columns, tickers[:1]])
-        close = raw["Close"].dropna(how="all")
+        raw_close = raw["Close"].dropna(how="all")
+        adjusted = raw.get("Adj Close", raw["Close"]).dropna(how="all")
+        close = adjusted
         if len(close) <= 5:
             raise ValueError("yfinance data empty or insufficient")
-        rows = []
+        rows, actions = [], []
         for tk in close.columns:
             for d in close.index:
-                c = raw["Close"].get(tk, pd.Series(dtype=float)).get(d)
-                if pd.isna(c):
+                adjusted_value = adjusted.get(tk, pd.Series(dtype=float)).get(d)
+                if pd.isna(adjusted_value):
                     continue
                 def g(field):
                     v = raw.get(field, pd.DataFrame()).get(tk, pd.Series(dtype=float)).get(d)
                     return None if v is None or pd.isna(v) else float(v)
-                rows.append((tk, d.strftime("%Y-%m-%d"),
-                             g("Open"), g("High"), g("Low"), float(c), g("Volume")))
-        return close, rows
+                raw_value = raw_close.get(tk, pd.Series(dtype=float)).get(d)
+                rows.append((
+                    tk, d.strftime("%Y-%m-%d"), g("Open"), g("High"), g("Low"),
+                    float(adjusted_value), g("Volume"),
+                    None if pd.isna(raw_value) else float(raw_value),
+                    float(adjusted_value), "yfinance", ingested_at))
+                for field, action in (("Dividends", "dividend"),
+                                      ("Stock Splits", "stock_split")):
+                    value = g(field)
+                    if value not in (None, 0.0):
+                        actions.append((tk, d.strftime("%Y-%m-%d"), action,
+                                        value, "yfinance", ingested_at))
+        instruments = [(tk, None, None, None, 1, "yfinance", ingested_at)
+                       for tk in tickers]
+        return close, rows, actions, instruments
 
     # ---- write with validation
 
-    def _write(self, close: pd.DataFrame, ohlcv_rows=None) -> int:
+    def _write(self, close: pd.DataFrame, ohlcv_rows=None,
+               action_rows=None, instrument_rows=None) -> int:
         flags, rows = [], []
+        ingested_at = _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")
         if ohlcv_rows is None:
+            source = (instrument_rows[0][5]
+                      if instrument_rows and instrument_rows[0][5] else "custom")
             for tk in close.columns:
                 s = close[tk].dropna()
                 s = s[s > 0]
-                rows += [(tk, d.strftime("%Y-%m-%d"), None, None, None, float(v), None)
+                rows += [(tk, d.strftime("%Y-%m-%d"), None, None, None,
+                          float(v), None, None, float(v), source, ingested_at)
                          for d, v in s.items()]
         else:
             rows = [r for r in ohlcv_rows if r[5] and r[5] > 0]
@@ -218,8 +281,26 @@ class PriceStore:
         with closing(self._conn()) as con, con:
             con.executemany(
                 "INSERT OR REPLACE INTO prices "
-                "(ticker, date, open, high, low, close, volume) VALUES (?,?,?,?,?,?,?)",
+                "(ticker, date, open, high, low, close, volume, raw_close, "
+                "adjusted_close, source, ingested_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 rows)
+            if action_rows:
+                con.executemany(
+                    "INSERT OR REPLACE INTO corporate_actions "
+                    "(ticker,date,action,value,source,ingested_at) VALUES (?,?,?,?,?,?)",
+                    action_rows)
+            if instrument_rows:
+                con.executemany(
+                    "INSERT INTO instruments "
+                    "(ticker,exchange,currency,timezone,active,source,updated_at) "
+                    "VALUES (?,?,?,?,?,?,?) ON CONFLICT(ticker) DO UPDATE SET "
+                    "exchange=COALESCE(excluded.exchange,instruments.exchange), "
+                    "currency=COALESCE(excluded.currency,instruments.currency), "
+                    "timezone=COALESCE(excluded.timezone,instruments.timezone), "
+                    "active=excluded.active, source=excluded.source, "
+                    "updated_at=excluded.updated_at",
+                    instrument_rows)
             if flags:
                 con.executemany(
                     "INSERT OR REPLACE INTO quality_flags (ticker, date, issue, value) "
@@ -238,6 +319,20 @@ class PriceStore:
         wide.index = pd.to_datetime(wide.index)
         return wide.sort_index()
 
+    def price_provenance(self, tickers=None) -> pd.DataFrame:
+        """Per-source row counts and freshness for the cached price universe."""
+        where, params = "", []
+        if tickers:
+            where = f"WHERE ticker IN ({','.join('?' * len(tickers))})"
+            params = list(tickers)
+        query = (
+            "SELECT COALESCE(source,'unknown') AS source, COUNT(*) AS rows, "
+            "MIN(date) AS start, MAX(date) AS end, MAX(ingested_at) AS last_ingested "
+            f"FROM prices {where} GROUP BY COALESCE(source,'unknown') "
+            "ORDER BY rows DESC")
+        with closing(self._conn()) as con:
+            return pd.read_sql(query, con, params=params)
+
     def _range(self, ticker: str):
         with closing(self._conn()) as con:
             row = con.execute("SELECT MIN(date), MAX(date) FROM prices WHERE ticker=?",
@@ -249,32 +344,36 @@ class PriceStore:
     def get_prices(self, tickers: list[str], start: str, end: str,
                    allow_synthetic_fallback: bool = True) -> tuple[pd.DataFrame, str]:
         """Close prices, incremental download of only what is missing."""
+        start = pd.Timestamp(start).date().isoformat()
+        end_ts = pd.Timestamp(end).normalize()
+        while end_ts.weekday() >= 5:
+            end_ts -= pd.Timedelta(days=1)
+        end = end_ts.date().isoformat()
         to_fetch: dict[str, tuple[str, str]] = {}
         for tk in tickers:
             rng = self._range(tk)
             if rng is None:
                 to_fetch[tk] = (start, end)
             else:
-                known_start, known_end = rng
-                # only fetch if the missing span actually contains business
-                # days - avoids pointless network calls (and their timeouts)
-                # for weekends/holidays at the edges of the cached range
-                if start < known_start and len(pd.bdate_range(
-                        start, pd.Timestamp(known_start)
-                        - pd.Timedelta(days=1))) > 0:
-                    to_fetch[tk] = (start, known_start)
-                if end > known_end and len(pd.bdate_range(
-                        pd.Timestamp(known_end) + pd.Timedelta(days=1),
-                        end)) > 0:
+                known_start, known_end = map(pd.Timestamp, rng)
+                requested_start = pd.Timestamp(start)
+                requested_end = pd.Timestamp(end)
+                # A one-to-three day discrepancy at the left edge is normally
+                # a weekend or exchange holiday, not missing history.
+                if requested_start < known_start - pd.Timedelta(days=3):
+                    to_fetch[tk] = (start, known_start.date().isoformat())
+                if requested_end > known_end:
                     seg = to_fetch.get(tk)
-                    to_fetch[tk] = (seg[0] if seg else known_end, end)
+                    to_fetch[tk] = (
+                        seg[0] if seg else known_end.date().isoformat(), end)
 
         if to_fetch:
             fetch_start = min(s for s, _ in to_fetch.values())
             fetch_end = max(e for _, e in to_fetch.values())
             try:
-                close, ohlcv = self._download(list(to_fetch), fetch_start, fetch_end)
-                n = self._write(close, ohlcv)
+                close, ohlcv, actions, instruments = self._download(
+                    list(to_fetch), fetch_start, fetch_end)
+                n = self._write(close, ohlcv, actions, instruments)
                 self._log("prices", list(to_fetch), fetch_start, fetch_end, n, "ok")
             except Exception as exc:  # noqa: BLE001
                 self._log("prices", list(to_fetch), fetch_start, fetch_end, 0,
@@ -298,19 +397,55 @@ class PriceStore:
                   f"global synthetic fallback.")
             return (data_mod.generate_synthetic_prices(tickers, start, end),
                     "synthetic")
-        return out[tickers].dropna(), "sqlite(yfinance)"
+        provenance = self.price_provenance(tickers)
+        sources = "+".join(provenance["source"].astype(str).tolist())
+        return out[tickers].dropna(), f"sqlite({sources or 'unknown'})"
 
     def get_ohlcv(self, ticker: str, start: str, end: str) -> pd.DataFrame:
         """Full daily bars for one ticker (whatever is cached)."""
         with closing(self._conn()) as con:
             df = pd.read_sql(
-                "SELECT date, open, high, low, close, volume FROM prices "
+                "SELECT date, open, high, low, raw_close, adjusted_close, "
+                "close, volume, source, ingested_at FROM prices "
                 "WHERE ticker=? AND date BETWEEN ? AND ? ORDER BY date",
                 con, params=[ticker, start, end])
         if df.empty:
             return df
         df["date"] = pd.to_datetime(df["date"])
         return df.set_index("date")
+
+    def corporate_actions(self, ticker: str | None = None) -> pd.DataFrame:
+        query = "SELECT * FROM corporate_actions"
+        params = []
+        if ticker:
+            query += " WHERE ticker=?"
+            params.append(ticker)
+        query += " ORDER BY ticker,date,action"
+        with closing(self._conn()) as con:
+            return pd.read_sql(query, con, params=params)
+
+    def instrument_master(self) -> pd.DataFrame:
+        with closing(self._conn()) as con:
+            return pd.read_sql(
+                "SELECT * FROM instruments ORDER BY ticker", con).set_index("ticker")
+
+    def upsert_instruments(self, rows: list[dict]):
+        now = _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")
+        values = [(r["ticker"], r.get("exchange"), r.get("currency"),
+                   r.get("timezone"), int(r.get("active", 1)),
+                   r.get("source", "manual"), now) for r in rows]
+        if not values:
+            return
+        with closing(self._conn()) as con, con:
+            con.executemany(
+                "INSERT INTO instruments "
+                "(ticker,exchange,currency,timezone,active,source,updated_at) "
+                "VALUES (?,?,?,?,?,?,?) ON CONFLICT(ticker) DO UPDATE SET "
+                "exchange=COALESCE(excluded.exchange,instruments.exchange), "
+                "currency=COALESCE(excluded.currency,instruments.currency), "
+                "timezone=COALESCE(excluded.timezone,instruments.timezone), "
+                "active=excluded.active,source=excluded.source,updated_at=excluded.updated_at",
+                values)
 
     # --------------------------------------------------------------- macro
 
@@ -481,6 +616,8 @@ class PriceStore:
             n_series = con.execute("SELECT COUNT(DISTINCT series) FROM macro").fetchone()[0]
             n_flags = con.execute("SELECT COUNT(*) FROM quality_flags").fetchone()[0]
             n_logs = con.execute("SELECT COUNT(*) FROM fetch_log").fetchone()[0]
+            n_actions = con.execute("SELECT COUNT(*) FROM corporate_actions").fetchone()[0]
+            n_instruments = con.execute("SELECT COUNT(*) FROM instruments").fetchone()[0]
             version = con.execute("PRAGMA user_version").fetchone()[0]
         return {
             "schema_version": version,
@@ -489,6 +626,7 @@ class PriceStore:
             "tickers": n_tickers, "price_rows": n_prices,
             "macro_series": n_series, "macro_rows": n_macro,
             "quality_flags": n_flags, "fetch_log_entries": n_logs,
+            "corporate_actions": n_actions, "instruments": n_instruments,
         }
 
     def export_csv(self, directory: str | Path) -> list[str]:
@@ -510,6 +648,16 @@ class PriceStore:
             path = directory / "macro.csv"
             macro.to_csv(path)
             written.append(str(path))
+        actions = self.corporate_actions()
+        if not actions.empty:
+            path = directory / "corporate_actions.csv"
+            actions.to_csv(path, index=False)
+            written.append(str(path))
+        instruments = self.instrument_master()
+        if not instruments.empty:
+            path = directory / "instruments.csv"
+            instruments.to_csv(path)
+            written.append(str(path))
         return written
 
     def vacuum(self):
@@ -522,6 +670,9 @@ class PriceStore:
             if ticker:
                 con.execute("DELETE FROM prices WHERE ticker=?", (ticker,))
                 con.execute("DELETE FROM quality_flags WHERE ticker=?", (ticker,))
+                con.execute("DELETE FROM corporate_actions WHERE ticker=?", (ticker,))
+                con.execute("DELETE FROM instruments WHERE ticker=?", (ticker,))
             else:
-                for t in ("prices", "macro", "quality_flags", "fetch_log"):
+                for t in ("prices", "macro", "quality_flags", "fetch_log",
+                          "corporate_actions", "instruments"):
                     con.execute(f"DELETE FROM {t}")

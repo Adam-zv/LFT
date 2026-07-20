@@ -17,6 +17,7 @@ allocation logic can be plugged in.
 
 from __future__ import annotations
 
+from concurrent.futures import CancelledError
 from dataclasses import dataclass
 
 import numpy as np
@@ -28,10 +29,11 @@ from . import optimization as opt
 # ----------------------------------------------------- strategy factories
 
 def make_max_sharpe(risk_free_rate: float = 0.0, max_weight: float = 1.0,
-                    shrinkage: bool = True):
+                    shrinkage: bool = True, mean_shrinkage: float = 0.5):
     """Robust MaxSharpe: Ledoit-Wolf covariance + weight cap."""
     def strategy(window: pd.DataFrame) -> pd.Series:
-        mu, cov = opt.annualized_inputs(window, shrinkage=shrinkage)
+        mu, cov = opt.annualized_inputs(
+            window, shrinkage=shrinkage, mean_shrinkage=mean_shrinkage)
         bounds = opt.weight_bounds(len(mu), max_weight)
         return opt.max_sharpe_weights(mu, cov, risk_free_rate, bounds)
     strategy.__name__ = "MaxSharpe_WF"
@@ -81,6 +83,9 @@ def walk_forward_backtest(
     rebalance: str = "M",
     initial_value: float = 10_000.0,
     tc_bps: float = 10.0,
+    progress_callback=None,
+    cancel_event=None,
+    progress_label: str = "Walk-forward",
 ) -> WalkForwardResult:
     """
     Run the strategy walk-forward.
@@ -108,6 +113,8 @@ def walk_forward_backtest(
 
     for date, r in returns.iterrows():
         idx = returns.index.get_loc(date)
+        if cancel_event is not None and cancel_event.is_set():
+            raise CancelledError()
 
         # 1. day's evolution with current weights
         if w is not None:
@@ -132,6 +139,8 @@ def walk_forward_backtest(
             w = target.copy()
             w_records[date] = target
             n_rebal += 1
+        if progress_callback is not None and (idx % 40 == 0 or date in rebal_set):
+            progress_callback((idx + 1) / len(returns), progress_label)
 
     equity = pd.Series(dict(curve), name=getattr(strategy, "__name__", "WF"))
     # keep only the invested phase (after the first rebalance)
@@ -155,10 +164,26 @@ def compare_walk_forward(
     rebalance: str = "M",
     initial_value: float = 10_000.0,
     tc_bps: float = 10.0,
+    progress_callback=None,
+    cancel_event=None,
 ) -> tuple[pd.DataFrame, dict[str, WalkForwardResult]]:
     """Backtest several walk-forward strategies over the same invested period."""
-    results = {name: walk_forward_backtest(prices, s, lookback, rebalance,
-                                           initial_value, tc_bps)
-               for name, s in strategies.items()}
+    results = {}
+    items = list(strategies.items())
+    total = max(len(items), 1)
+    for i, (name, strategy) in enumerate(items):
+        if cancel_event is not None and cancel_event.is_set():
+            raise CancelledError()
+
+        def report(local_fraction, message, offset=i):
+            if progress_callback is not None:
+                progress_callback((offset + local_fraction) / total, message)
+
+        results[name] = walk_forward_backtest(
+            prices, strategy, lookback, rebalance, initial_value, tc_bps,
+            progress_callback=report, cancel_event=cancel_event,
+            progress_label=f"Backtesting {name}")
+        if progress_callback is not None:
+            progress_callback((i + 1) / total, f"Completed {name}")
     curves = pd.DataFrame({n: r.equity_curve for n, r in results.items()})
     return curves, results

@@ -83,8 +83,12 @@ def df_to_tree(tree: ttk.Treeview, df: pd.DataFrame, index_name: str = ""):
     tree.configure(columns=cols, show="headings")
     for c in cols:
         tree.heading(c, text=c)
-        tree.column(c, width=max(70, min(160, 11 * len(c))), anchor="e")
-    tree.column(cols[0], anchor="w", width=150)
+        # stretch=False: columns keep a readable fixed width instead of
+        # spreading across the whole window (the "giant gap" effect).
+        tree.column(c, width=max(70, min(160, 11 * len(c))), anchor="e",
+                    stretch=False)
+    tree.column(cols[0], anchor="w", width=max(150, min(260, 9 * max(
+        (len(str(i)) for i in df.index), default=12))), stretch=False)
     for idx, row in df.iterrows():
         vals = [idx] + [("" if pd.isna(v) else round(v, 4) if isinstance(v, float) else v)
                         for v in row]
@@ -121,7 +125,10 @@ class Gui(tk.Tk):
         self.geometry(f"{width}x{height}")
         self.minsize(min(width, round(980 * self._ui_scale)),
                      min(height, round(640 * self._ui_scale)))
-        self._plot_dpi = max(110, min(190, round(self._display_dpi * 1.12)))
+        # Keep figure pixel sizes close to the LOGICAL UI size: at high
+        # display DPI a large plot_dpi produces figures bigger than the
+        # window itself, so charts looked cropped / "too zoomed".
+        self._plot_dpi = max(96, min(125, round(self._display_dpi * 0.85)))
         self.configure(bg=APP_BG)
         self._configure_style()
         self._set_lft_icon()
@@ -881,7 +888,7 @@ class Gui(tk.Tk):
             self.txt_flags.delete("1.0", "end")
             self.txt_flags.insert("1.0", "\n".join(f"- {f}" for f in flags))
 
-            fig = self.new_figure((7.5, 4.2))
+            fig = self.new_figure((8.6, 4.4))
             ax1 = fig.add_subplot(121)
             rc_plot = rc[rc["weight"] > 0].iloc[::-1]
             y = range(len(rc_plot))
@@ -891,8 +898,10 @@ class Gui(tk.Tk):
                      height=0.38, label="Risk contribution", color="#d85a30")
             ax1.set_yticks(list(y), rc_plot.index)
             ax1.set_title("Who carries the risk?", fontsize=10)
-            ax1.legend(fontsize=7)
+            ax1.legend(fontsize=7, loc="lower right", framealpha=0.95)
             ax1.grid(alpha=0.3, axis="x")
+            ax1.set_xlim(0, max(rc_plot["risk_contribution"].max(),
+                                rc_plot["weight"].max()) * 1.18)
 
             ax2 = fig.add_subplot(122)
             ax2.plot(bench_curve.index, bench_curve, color="black", lw=1.1)
@@ -907,10 +916,15 @@ class Gui(tk.Tk):
                 ax2.axvspan(a, b, color=REGIME_COLORS.get(lbl, "#ccc"), alpha=0.25)
             ax2.set_title("Market regimes (benchmark)", fontsize=10)
             ax2.tick_params(axis="x", labelsize=7)
+            ax2.yaxis.set_major_locator(mpl.ticker.MaxNLocator(6))
+            ax2.margins(x=0.01)
             ax2.grid(alpha=0.3)
             handles = [Patch(facecolor=c, alpha=0.4, label=l)
                        for l, c in REGIME_COLORS.items()]
-            ax2.legend(handles=handles, fontsize=6, loc="upper left")
+            # Legend BELOW the plot: inside the axes it covered the regime
+            # bands and the price curve on wide screens.
+            ax2.legend(handles=handles, fontsize=7, loc="upper center",
+                       bbox_to_anchor=(0.5, -0.16), ncol=4, frameon=False)
 
             for w_ in self.chart_health.winfo_children():
                 w_.destroy()
@@ -1034,7 +1048,7 @@ class Gui(tk.Tk):
             (alloc, frontier, cloud, band, pts, cap, n_boot,
              frontier_points) = payload
             df_to_tree(self.tree_opt, alloc.T, "strategy")
-            fig = self.new_figure((8.0, 4.6))
+            fig = self.new_figure((8.6, 4.6))
             ax = fig.add_subplot(111)
             ax.scatter(cloud["volatility"], cloud["return"], s=6, alpha=0.3,
                        color="#9db4c8")
@@ -1050,14 +1064,20 @@ class Gui(tk.Tk):
             markers = {"Current": ("o", "black")}
             for name, (v, r) in pts.items():
                 mk, col = markers.get(name, ("D", None))
-                ax.scatter([v], [r], marker=mk, s=60, label=name,
+                ax.scatter([v], [r], marker=mk, s=46, label=name,
                            color=col, zorder=5, edgecolors="black")
             ax.set_xlabel("Annualized volatility")
             ax.set_ylabel("Expected annualized return")
             ax.set_title(f"Constrained frontier | {frontier_points} targets | "
                          f"{cap:.0%} max per asset",
                          fontsize=10)
-            ax.legend(fontsize=7)
+            ax.xaxis.set_major_formatter(mpl.ticker.PercentFormatter(1.0, decimals=0))
+            ax.yaxis.set_major_formatter(mpl.ticker.PercentFormatter(1.0, decimals=0))
+            # Legend OUTSIDE the axes (right): inside, it covered half of the
+            # frontier and the strategy markers.
+            ax.legend(fontsize=7, loc="center left",
+                      bbox_to_anchor=(1.01, 0.5), borderaxespad=0.0,
+                      framealpha=0.95)
             ax.grid(alpha=0.3)
             focus, = ax.plot([], [], "o", ms=8, mfc="none", mec="black",
                              mew=1.5, visible=False, zorder=9)
@@ -1333,8 +1353,12 @@ class Gui(tk.Tk):
             ax.set_ylim(low - pad, high + pad)
             ax.set_xlabel("Trading days")
             ax.set_ylabel("Portfolio value")
+            ax.yaxis.set_major_formatter(
+                mpl.ticker.FuncFormatter(lambda v, _: f"{v:,.0f}"))
             ax.grid(alpha=0.3)
-            ax.legend(fontsize=8)
+            # Legend below the plot: inside, it sat on top of the fan of paths.
+            ax.legend(fontsize=8, loc="upper center",
+                      bbox_to_anchor=(0.5, -0.13), ncol=3, frameon=False)
             highlight, = ax.plot([], [], color="#d43f3a", lw=2.1,
                                  zorder=8, visible=False)
             annotation = ax.annotate(
@@ -1485,7 +1509,7 @@ class Gui(tk.Tk):
                 return
             stats, curves = payload
             df_to_tree(self.tree_bt, stats, "metric")
-            fig = self.new_figure((8.0, 4.1))
+            fig = self.new_figure((8.6, 4.2))
             ax = fig.add_subplot(111)
             lines = {}
             for col in curves.columns:
@@ -1493,7 +1517,11 @@ class Gui(tk.Tk):
                 lines[col] = line
             ax.set_yscale("log")
             ax.set_ylabel("Value (log scale)")
-            ax.legend(fontsize=7)
+            # Legend outside the axes (right): inside, it overlapped the
+            # early part of the equity curves on the log scale.
+            ax.legend(fontsize=7, loc="center left",
+                      bbox_to_anchor=(1.01, 0.5), borderaxespad=0.0,
+                      framealpha=0.95)
             ax.grid(alpha=0.3)
             annotation = ax.annotate(
                 "", xy=(0, 0), xytext=(10, 12), textcoords="offset points",

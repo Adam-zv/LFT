@@ -2,8 +2,7 @@
 
 LFT is a Windows desktop application for portfolio analysis, risk diagnostics,
 optimization, projection and walk-forward backtesting. It is an educational
-decision-support tool: it reads portfolios and market data, but never sends an
-order to a broker.
+decision-support tool: it reads portfolios and market data,
 
 ## Windows quick start
 

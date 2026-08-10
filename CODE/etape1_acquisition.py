@@ -15,7 +15,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import yfinance as yf
-aokzpaazedad
 
 from config import (
     ALL_TICKERS, TICKER_TO_BENCHMARK, MARKET_BENCHMARKS, PERIODS,

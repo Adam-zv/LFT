@@ -1,4 +1,4 @@
-import numpy as np
+  azazdazd import numpy as np
 
 # ─────────────────────────────────────────────
 # UNIVERSE OF TICKERS
